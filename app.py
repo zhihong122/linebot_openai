@@ -17,7 +17,7 @@ app = Flask(__name__)
 # LINE
 channel_access_token = os.getenv("CHANNEL_ACCESS_TOKEN")
 channel_secret = os.getenv("CHANNEL_SECRET")
-api_key = os.getenv("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")
+api_key = os.getenv("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")
 
 if not channel_access_token:
     raise RuntimeError("CHANNEL_ACCESS_TOKEN 沒有設定")
