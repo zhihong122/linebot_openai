@@ -19,7 +19,7 @@ line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
 
 # ===== OpenAI 設定 =====
-api_key = os.getenv("OPENAI_API_KEY")
+api_key = os.getenv("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")
 if not api_key:
     raise RuntimeError("OPENAI_API_KEY 沒有設定")
 
