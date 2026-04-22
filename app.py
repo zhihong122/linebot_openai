@@ -30,7 +30,7 @@ def GPT_response(text):
     response = client.responses.create(
         prompt={
             "id": "pmpt_69e7a0c125c88193b36b94ee709a31d309f162074e777845",
-            "version": "2"
+            "version": "3"
         },
         input=text
     )
