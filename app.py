@@ -1,8 +1,13 @@
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import TextSendMessage, MessageEvent, TextMessage, PostbackEvent, MemberJoinedEvent
-
+from linebot.models import (
+    TextSendMessage,
+    MessageEvent,
+    TextMessage,
+    PostbackEvent,
+    MemberJoinedEvent,
+)
 import os
 import traceback
 from openai import OpenAI
@@ -15,22 +20,22 @@ handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
 
 # ===== OpenAI 設定 =====
 api_key = os.getenv("OPENAI_API_KEY")
-
 if not api_key:
-    print("❌ OPENAI_API_KEY 沒有設定！")
-else:
-    print("✅ OPENAI_API_KEY 已載入")
+    raise RuntimeError("OPENAI_API_KEY 沒有設定")
 
 client = OpenAI(api_key=api_key)
 
 
 # ===== GPT 回應 =====
-def GPT_response(text):
-    response = client.responses.create(
+def GPT_response(text: str) -> str:
+    response = client.chat.completions.create(
         model="gpt-4o-mini",
-        input=text
+        messages=[
+            {"role": "system", "content": "你是一個友善、簡潔的 LINE 助手。"},
+            {"role": "user", "content": text},
+        ],
     )
-    return response.output_text.strip()
+    return response.choices[0].message.content or "我暫時沒有產生回覆。"
 
 
 # ===== Webhook =====
@@ -53,12 +58,7 @@ def handle_text_message(event):
     msg = event.message.text
 
     try:
-        response = client.responses.create(
-            model="gpt-4o-mini",
-            input=msg
-        )
-
-        gpt_answer = response.output_text.strip()
+        gpt_answer = GPT_response(msg)
         print("✅ GPT:", gpt_answer)
 
         line_bot_api.reply_message(
@@ -67,11 +67,9 @@ def handle_text_message(event):
         )
 
     except Exception as e:
-        # 🔥 印出真正錯誤（Render log 會看到）
         print("🔥 OPENAI ERROR:", repr(e))
         print(traceback.format_exc())
 
-        # 🔥 直接把錯誤回給 LINE（方便你測試）
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text=f"錯誤：{str(e)}")
