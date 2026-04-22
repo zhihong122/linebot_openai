@@ -27,12 +27,14 @@ openai.api_key = os.getenv('OPENAI_API_KEY')
 
 
 def GPT_response(text):
-    # 接收回應
-    response = openai.Completion.create(model="gpt-3.5-turbo-instruct", prompt=text, temperature=0.5, max_tokens=500)
-    print(response)
-    # 重組回應
-    answer = response['choices'][0]['text'].replace('。','')
-    return answer
+    response = client.responses.create(
+        prompt={
+            "id": "pmpt_69e7a0c125c88193b36b94ee709a31d309f162074e777845",
+            "version": "2"
+        },
+        input=text
+    )
+    return response.output_text.strip()
 
 
 # 監聽所有來自 /callback 的 Post Request
