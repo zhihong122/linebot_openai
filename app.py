@@ -9,14 +9,22 @@ from openai import OpenAI
 
 app = Flask(__name__)
 
-# LINE
+# ===== LINE 設定 =====
 line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
 
-# OpenAI
-client = OpenAI(api_key=os.getenv("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"))
+# ===== OpenAI 設定 =====
+api_key = os.getenv("OPENAI_API_KEY")
+
+if not api_key:
+    print("❌ OPENAI_API_KEY 沒有設定！")
+else:
+    print("✅ OPENAI_API_KEY 已載入")
+
+client = OpenAI(api_key=api_key)
 
 
+# ===== GPT 回應 =====
 def GPT_response(text):
     response = client.responses.create(
         model="gpt-4o-mini",
@@ -25,11 +33,11 @@ def GPT_response(text):
     return response.output_text.strip()
 
 
+# ===== Webhook =====
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers["X-Line-Signature"]
     body = request.get_data(as_text=True)
-    app.logger.info("Request body: " + body)
 
     try:
         handler.handle(body, signature)
@@ -39,20 +47,22 @@ def callback():
     return "OK"
 
 
+# ===== 文字訊息處理 =====
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
     msg = event.message.text
 
     try:
         gpt_answer = GPT_response(msg)
-        print("GPT ANSWER:", gpt_answer)
+        print("GPT:", gpt_answer)
 
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text=gpt_answer)
         )
+
     except Exception as e:
-        print("OPENAI ERROR:", repr(e))
+        print("🔥 OPENAI ERROR:", repr(e))
         print(traceback.format_exc())
 
         line_bot_api.reply_message(
@@ -61,11 +71,13 @@ def handle_text_message(event):
         )
 
 
+# ===== Postback =====
 @handler.add(PostbackEvent)
 def handle_postback(event):
-    print("POSTBACK DATA:", event.postback.data)
+    print("POSTBACK:", event.postback.data)
 
 
+# ===== 加入群組 =====
 @handler.add(MemberJoinedEvent)
 def welcome(event):
     uid = event.joined.members[0].user_id
@@ -79,6 +91,7 @@ def welcome(event):
     )
 
 
+# ===== 啟動 =====
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
