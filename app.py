@@ -32,16 +32,15 @@ line_bot_api = LineBotApi(channel_access_token)
 handler = WebhookHandler(channel_secret)
 client = OpenAI(api_key=api_key)
 
-
-def GPT_response(text: str) -> str:
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "你是一個友善、簡潔的 LINE 助手。"},
-            {"role": "user", "content": text},
-        ],
+def GPT_response(text):
+    response = client.responses.create(
+        prompt={
+            "id": "pmpt_69e86fa11c1c8193bf0389182d0c664c0cc0ed66294ebdce",
+            "version": "1"
+        },
+        input=text
     )
-    return response.choices[0].message.content or "我暫時沒有產生回覆。"
+    return response.output_text
 
 
 @app.route("/callback", methods=["POST"])
