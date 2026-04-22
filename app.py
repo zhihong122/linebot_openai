@@ -14,19 +14,25 @@ from openai import OpenAI
 
 app = Flask(__name__)
 
-# ===== LINE 設定 =====
-line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
-handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
+# LINE
+channel_access_token = os.getenv("CHANNEL_ACCESS_TOKEN")
+channel_secret = os.getenv("CHANNEL_SECRET")
+api_key = os.getenv("OPENAI_API_KEY")
 
-# ===== OpenAI 設定 =====
-api_key = os.getenv("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")
+if not channel_access_token:
+    raise RuntimeError("CHANNEL_ACCESS_TOKEN 沒有設定")
+
+if not channel_secret:
+    raise RuntimeError("CHANNEL_SECRET 沒有設定")
+
 if not api_key:
     raise RuntimeError("OPENAI_API_KEY 沒有設定")
 
+line_bot_api = LineBotApi(channel_access_token)
+handler = WebhookHandler(channel_secret)
 client = OpenAI(api_key=api_key)
 
 
-# ===== GPT 回應 =====
 def GPT_response(text: str) -> str:
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -38,7 +44,6 @@ def GPT_response(text: str) -> str:
     return response.choices[0].message.content or "我暫時沒有產生回覆。"
 
 
-# ===== Webhook =====
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers["X-Line-Signature"]
@@ -52,22 +57,20 @@ def callback():
     return "OK"
 
 
-# ===== 文字訊息處理 =====
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
     msg = event.message.text
 
     try:
         gpt_answer = GPT_response(msg)
-        print("✅ GPT:", gpt_answer)
+        print("GPT:", gpt_answer)
 
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text=gpt_answer)
         )
-
     except Exception as e:
-        print("🔥 OPENAI ERROR:", repr(e))
+        print("OPENAI ERROR:", repr(e))
         print(traceback.format_exc())
 
         line_bot_api.reply_message(
@@ -76,13 +79,11 @@ def handle_text_message(event):
         )
 
 
-# ===== Postback =====
 @handler.add(PostbackEvent)
 def handle_postback(event):
     print("POSTBACK:", event.postback.data)
 
 
-# ===== 加入群組 =====
 @handler.add(MemberJoinedEvent)
 def welcome(event):
     uid = event.joined.members[0].user_id
@@ -96,7 +97,6 @@ def welcome(event):
     )
 
 
-# ===== 啟動 =====
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
