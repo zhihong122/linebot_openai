@@ -53,8 +53,13 @@ def handle_text_message(event):
     msg = event.message.text
 
     try:
-        gpt_answer = GPT_response(msg)
-        print("GPT:", gpt_answer)
+        response = client.responses.create(
+            model="gpt-4o-mini",
+            input=msg
+        )
+
+        gpt_answer = response.output_text.strip()
+        print("✅ GPT:", gpt_answer)
 
         line_bot_api.reply_message(
             event.reply_token,
@@ -62,12 +67,14 @@ def handle_text_message(event):
         )
 
     except Exception as e:
+        # 🔥 印出真正錯誤（Render log 會看到）
         print("🔥 OPENAI ERROR:", repr(e))
         print(traceback.format_exc())
 
+        # 🔥 直接把錯誤回給 LINE（方便你測試）
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="系統暫時發生錯誤，請稍後再試")
+            TextSendMessage(text=f"錯誤：{str(e)}")
         )
 
 
