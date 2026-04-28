@@ -53,17 +53,13 @@ def safe_text(text: str, limit: int = 5000) -> str:
 
 def gpt_response(user_text: str) -> str:
     response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
-            {
-                "role": "system",
-                "content": "你是一個友善、清楚、簡潔的 LINE 助手，請使用繁體中文回覆。"
-            },
-            {
-                "role": "user",
-                "content": user_text
+        prompt={
+            "id": "pmpt_69e86fa11c1c8193bf0389182d0c664c0cc0ed66294ebdce",
+            "version": "2",
+            "variables": {
+                "user_input": user_text
             }
-        ]
+        }
     )
 
     answer = getattr(response, "output_text", "").strip()
