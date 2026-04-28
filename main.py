@@ -1,7 +1,7 @@
-from flask import Flask, request, abort
-
+from fastapi import FastAPI, Request, HTTPException
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from linebot.v3.messaging import (
     Configuration,
     ApiClient,
@@ -9,31 +9,33 @@ from linebot.v3.messaging import (
     ReplyMessageRequest,
     TextMessage
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+import os
 
-app = Flask(__name__)
+app = FastAPI()
 
-LINE_CHANNEL_ACCESS_TOKEN = "你的 Channel access token"
-LINE_CHANNEL_SECRET = "你的 Channel secret"
+configuration = Configuration(
+    access_token=os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+)
+handler = WebhookHandler(
+    os.getenv("LINE_CHANNEL_SECRET")
+)
 
-configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-
-@app.route("/", methods=["GET"])
+@app.get("/")
 def home():
-    return "LINE Bot is running!"
+    return {"status": "LINE Bot is running"}
 
 
-@app.route("/callback", methods=["POST"])
-def callback():
+@app.post("/callback")
+async def callback(request: Request):
     signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)
+    body = await request.body()
+    body = body.decode("utf-8")
 
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        abort(400)
+        raise HTTPException(status_code=400, detail="Invalid signature")
 
     return "OK"
 
@@ -52,7 +54,3 @@ def handle_message(event):
                 ]
             )
         )
-
-
-if __name__ == "__main__":
-    app.run()
