@@ -1,5 +1,0 @@
-line-bot-sdk
-flask
-openai==1.30.0
-httpx==0.27.2
-gunicorn
