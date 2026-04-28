@@ -1,7 +1,20 @@
 from flask import Flask, request, abort
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import *
+
+from linebot.v3 import WebhookHandler
+from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.messaging import (
+    Configuration,
+    ApiClient,
+    MessagingApi,
+    ReplyMessageRequest,
+    TextMessage
+)
+from linebot.v3.webhooks import (
+    MessageEvent,
+    TextMessageContent,
+    PostbackEvent,
+    MemberJoinedEvent
+)
 
 import os
 import traceback
@@ -9,91 +22,120 @@ from openai import OpenAI
 
 app = Flask(__name__)
 
-# 環境變數
 CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN")
 CHANNEL_SECRET = os.getenv("CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# 初始化
-line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
+if not CHANNEL_ACCESS_TOKEN:
+    raise ValueError("缺少 CHANNEL_ACCESS_TOKEN")
+if not CHANNEL_SECRET:
+    raise ValueError("缺少 CHANNEL_SECRET")
+if not OPENAI_API_KEY:
+    raise ValueError("缺少 OPENAI_API_KEY")
+
+configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-def GPT_response(text):
+def gpt_response(text: str) -> str:
     response = client.responses.create(
         model="gpt-4.1-mini",
         input=text
     )
-    answer = response.output_text.strip()
+
+    answer = getattr(response, "output_text", "").strip()
+    if not answer:
+        answer = "目前沒有取得回應，請再試一次。"
     return answer
 
 
-# 監聽 /callback
-@app.route("/callback", methods=['POST'])
+@app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get('X-Line-Signature', '')
+    signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
     app.logger.info("Request body: " + body)
 
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        app.logger.error("Invalid signature. Check your channel secret.")
+        app.logger.error("Invalid signature. Please check your channel secret.")
         abort(400)
     except Exception as e:
-        app.logger.error(f"Handler error: {repr(e)}")
+        app.logger.error(f"Webhook handle error: {repr(e)}")
         abort(500)
 
-    return 'OK'
+    return "OK"
 
 
-# 處理文字訊息
-@handler.add(MessageEvent, message=TextMessage)
+@handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event):
-    msg = event.message.text
+    user_text = event.message.text
+
     try:
-        print(f"User message: {msg}")
+        reply_text = gpt_response(user_text)
+        if len(reply_text) > 5000:
+            reply_text = reply_text[:4990] + "..."
 
-        gpt_answer = GPT_response(msg)
-        print(f"GPT answer: {gpt_answer}")
-
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=gpt_answer[:5000])  # LINE文字上限保守處理
-        )
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]
+                )
+            )
 
     except Exception as e:
-        print("=== OpenAI / Reply Error ===")
-        print(traceback.format_exc())
+        error_detail = traceback.format_exc()
+        app.logger.error(error_detail)
 
-        error_msg = f"發生錯誤：{str(e)}"
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=error_msg[:5000])
-        )
+        error_text = f"發生錯誤：{str(e)}"
+        if len(error_text) > 5000:
+            error_text = error_text[:4990] + "..."
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=error_text)]
+                )
+            )
 
 
-# 處理 Postback
 @handler.add(PostbackEvent)
 def handle_postback(event):
-    print("Postback data:", event.postback.data)
+    app.logger.info(f"Postback data: {event.postback.data}")
 
 
-# 新成員加入群組歡迎訊息
 @handler.add(MemberJoinedEvent)
 def welcome(event):
     try:
-        uid = event.joined.members[0].user_id
-        gid = event.source.group_id
-        profile = line_bot_api.get_group_member_profile(gid, uid)
-        name = profile.display_name
+        joined_user_id = event.joined.members[0].user_id
+        group_id = event.source.group_id
 
-        message = TextSendMessage(text=f'{name} 歡迎加入')
-        line_bot_api.reply_message(event.reply_token, message)
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            profile = line_bot_api.get_group_member_profile(
+                group_id=group_id,
+                user_id=joined_user_id
+            )
 
+            welcome_text = f"{profile.display_name} 歡迎加入"
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=welcome_text)]
+                )
+            )
     except Exception:
-        print(traceback.format_exc())
+        app.logger.error(traceback.format_exc())
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return "LINE Bot is running."
 
 
 if __name__ == "__main__":
