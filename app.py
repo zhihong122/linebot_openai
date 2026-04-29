@@ -155,6 +155,7 @@ def handle_text_message(event):
 # ===== 圖片訊息 =====
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event):
+    app.logger.info("===== NEW IMAGE HANDLER VERSION 20260429 =====")
     app.logger.info("===== handle_image_message triggered =====")
     app.logger.info(f"image message id: {event.message.id}")
     app.logger.info(f"reply token exists: {bool(event.reply_token)}")
