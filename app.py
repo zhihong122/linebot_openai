@@ -48,7 +48,7 @@ def get_messaging_api():
 
 def safe_text(text: str, limit: int = 5000) -> str:
     text = str(text)
-    return text if len(text) <= limit else text[:limit - 3] + "..."
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 def gpt_response(user_text: str) -> str:
@@ -59,10 +59,7 @@ def gpt_response(user_text: str) -> str:
     response = client.responses.create(
         prompt={
             "id": "pmpt_69e86fa11c1c8193bf0389182d0c664c0cc0ed66294ebdce",
-            "version": "3",
-            "variables": {
-                "user_input": user_text
-            }
+            "version": "3"
         }
     )
 
@@ -70,7 +67,7 @@ def gpt_response(user_text: str) -> str:
     app.logger.info(f"===== OpenAI raw output_text ===== {answer}")
 
     if not answer:
-        answer = "OpenAI 有回應，但內容是空的"
+        answer = "目前沒有取得回應，請再試一次。"
 
     return answer
 
