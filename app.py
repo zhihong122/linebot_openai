@@ -57,8 +57,13 @@ def gpt_response(user_text: str) -> str:
     app.logger.info(f"user_text: {user_text}")
 
     response = client.responses.create(
-        model="gpt-5.5",
-        input=user_text
+        prompt={
+            "id": "pmpt_69e86fa11c1c8193bf0389182d0c664c0cc0ed66294ebdce",
+            "version": "3",
+            "variables": {
+                "user_input": user_text
+            }
+        }
     )
 
     answer = getattr(response, "output_text", "").strip()
