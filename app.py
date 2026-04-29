@@ -168,8 +168,7 @@ def handle_image_message(event):
             message_content = blob_api.get_message_content(message_id=event.message.id)
 
             with open(image_path, "wb") as f:
-                for chunk in message_content:
-                    f.write(chunk)
+                f.write(message_content)
         finally:
             api_client_blob.close()
 
