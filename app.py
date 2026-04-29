@@ -55,6 +55,7 @@ def home():
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
+
     app.logger.info("===== webhook hit =====")
     app.logger.info("Request body: " + body)
 
@@ -70,7 +71,7 @@ def callback():
     return "OK"
 
 
-# ===== 收到文字後，直接 reply_message 固定文字 =====
+# ===== 收到文字訊息後，直接固定回覆 =====
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event):
     app.logger.info("===== handle_text_message triggered =====")
