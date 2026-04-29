@@ -8,6 +8,7 @@ from linebot.v3.messaging import (
     Configuration,
     ApiClient,
     MessagingApi,
+    MessagingApiBlob,
     ReplyMessageRequest,
     PushMessageRequest,
     TextMessage,
@@ -15,6 +16,7 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import (
     MessageEvent,
     TextMessageContent,
+    ImageMessageContent,
     PostbackEvent,
     MemberJoinedEvent,
 )
@@ -22,6 +24,10 @@ from linebot.v3.webhooks import (
 from openai import OpenAI
 
 app = Flask(__name__)
+
+# ===== 路徑設定 =====
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+static_tmp_path = os.path.join(BASE_DIR, "static", "tmp")
 
 # ===== 環境變數 =====
 CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN")
@@ -44,6 +50,11 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 def get_messaging_api():
     api_client = ApiClient(configuration)
     return api_client, MessagingApi(api_client)
+
+
+def get_blob_api():
+    api_client = ApiClient(configuration)
+    return api_client, MessagingApiBlob(api_client)
 
 
 def safe_text(text: str, limit: int = 5000) -> str:
@@ -100,6 +111,7 @@ def callback():
     return "OK"
 
 
+# ===== 文字訊息 =====
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event):
     app.logger.info("===== handle_text_message triggered =====")
@@ -140,12 +152,69 @@ def handle_text_message(event):
             api_client.close()
 
 
+# ===== 圖片訊息 =====
+@handler.add(MessageEvent, message=ImageMessageContent)
+def handle_image_message(event):
+    app.logger.info("===== handle_image_message triggered =====")
+    app.logger.info(f"image message id: {event.message.id}")
+    app.logger.info(f"reply token exists: {bool(event.reply_token)}")
+
+    try:
+        os.makedirs(static_tmp_path, exist_ok=True)
+        image_path = os.path.join(static_tmp_path, f"{event.message.id}.jpg")
+
+        api_client_blob, blob_api = get_blob_api()
+        try:
+            message_content = blob_api.get_message_content(message_id=event.message.id)
+
+            with open(image_path, "wb") as f:
+                for chunk in message_content:
+                    f.write(chunk)
+        finally:
+            api_client_blob.close()
+
+        api_client_msg, line_bot_api = get_messaging_api()
+        try:
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[
+                        TextMessage(text="已收到藥袋圖片，接下來會進行 AI 辨識。")
+                    ]
+                )
+            )
+            app.logger.info(f"===== image saved: {image_path} =====")
+            app.logger.info("===== image reply sent =====")
+        finally:
+            api_client_msg.close()
+
+    except Exception:
+        app.logger.error("===== handle_image_message exception =====")
+        app.logger.error(traceback.format_exc())
+
+        api_client_msg, line_bot_api = get_messaging_api()
+        try:
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[
+                        TextMessage(text="圖片處理失敗，請查看後台 log。")
+                    ]
+                )
+            )
+            app.logger.info("===== image error reply sent =====")
+        finally:
+            api_client_msg.close()
+
+
+# ===== Postback =====
 @handler.add(PostbackEvent)
 def handle_postback(event):
     app.logger.info("===== PostbackEvent triggered =====")
     app.logger.info(f"Postback data: {event.postback.data}")
 
 
+# ===== 有人加入群組 =====
 @handler.add(MemberJoinedEvent)
 def welcome(event):
     app.logger.info("===== MemberJoinedEvent triggered =====")
@@ -176,6 +245,7 @@ def welcome(event):
         app.logger.error(traceback.format_exc())
 
 
+# ===== 主動推播測試 =====
 @app.route("/test-push", methods=["GET"])
 def test_push():
     user_id = request.args.get("to")
