@@ -19,26 +19,20 @@ from linebot.v3.webhooks import (
     MemberJoinedEvent,
 )
 
-from openai import OpenAI
-
 app = Flask(__name__)
 
 # ===== 環境變數 =====
 CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN")
 CHANNEL_SECRET = os.getenv("CHANNEL_SECRET")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not CHANNEL_ACCESS_TOKEN:
     raise ValueError("缺少 CHANNEL_ACCESS_TOKEN")
 if not CHANNEL_SECRET:
     raise ValueError("缺少 CHANNEL_SECRET")
-if not OPENAI_API_KEY:
-    raise ValueError("缺少 OPENAI_API_KEY")
 
 # ===== 初始化 =====
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
-client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 def get_messaging_api():
@@ -51,23 +45,6 @@ def safe_text(text: str, limit: int = 5000) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
-def gpt_response(user_text: str) -> str:
-    response = client.responses.create(
-        prompt={
-            "id": "pmpt_69e86fa11c1c8193bf0389182d0c664c0cc0ed66294ebdce",
-            "version": "2",
-            "variables": {
-                "user_input": user_text
-            }
-        }
-    )
-
-    answer = getattr(response, "output_text", "").strip()
-    if not answer:
-        answer = "目前沒有取得回應，請再試一次。"
-    return answer
-
-
 @app.route("/", methods=["GET"])
 def home():
     return "LINE Bot is running."
@@ -78,6 +55,7 @@ def home():
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
+    app.logger.info("===== webhook hit =====")
     app.logger.info("Request body: " + body)
 
     try:
@@ -92,39 +70,25 @@ def callback():
     return "OK"
 
 
-# ===== 收到文字後，呼叫 OpenAI，再 reply_message =====
+# ===== 收到文字後，直接 reply_message 固定文字 =====
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event):
-    user_text = event.message.text
+    app.logger.info("===== handle_text_message triggered =====")
+    app.logger.info(f"user text: {event.message.text}")
 
+    api_client, line_bot_api = get_messaging_api()
     try:
-        reply_text = safe_text(gpt_response(user_text))
-
-        api_client, line_bot_api = get_messaging_api()
-        try:
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=reply_text)]
-                )
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text="我有收到你的訊息")]
             )
-        finally:
-            api_client.close()
-
-    except Exception as e:
+        )
+        app.logger.info("===== reply_message sent =====")
+    except Exception:
         app.logger.error(traceback.format_exc())
-
-        error_text = safe_text(f"發生錯誤：{str(e)}")
-        api_client, line_bot_api = get_messaging_api()
-        try:
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=error_text)]
-                )
-            )
-        finally:
-            api_client.close()
+    finally:
+        api_client.close()
 
 
 # ===== Postback =====
@@ -161,7 +125,7 @@ def welcome(event):
         app.logger.error(traceback.format_exc())
 
 
-# ===== 主動推播測試：push_message =====
+# ===== 主動推播測試 =====
 @app.route("/push-test", methods=["GET"])
 def push_test():
     user_id = request.args.get("to")
