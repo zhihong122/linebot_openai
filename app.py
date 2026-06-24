@@ -27,6 +27,7 @@ from linebot.v3.webhooks import (
     PostbackEvent,
     MemberJoinedEvent,
     FollowEvent,
+    UnfollowEvent,
 )
 
 from openai import OpenAI
@@ -66,10 +67,10 @@ CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN")
 CHANNEL_SECRET = os.getenv("CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Render PostgreSQL 提供的 Internal Database URL
+# Render PostgreSQL 的 Internal Database URL
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# 三種身份對應的 Rich Menu ID
+# 三個身份對應的 Rich Menu ID
 FAMILY_RICH_MENU_ID = os.getenv("FAMILY_RICH_MENU_ID")
 CAREGIVER_RICH_MENU_ID = os.getenv("CAREGIVER_RICH_MENU_ID")
 ELDERLY_RICH_MENU_ID = os.getenv("ELDERLY_RICH_MENU_ID")
@@ -113,7 +114,9 @@ configuration = Configuration(
     access_token=CHANNEL_ACCESS_TOKEN
 )
 
-handler = WebhookHandler(CHANNEL_SECRET)
+handler = WebhookHandler(
+    CHANNEL_SECRET
+)
 
 client = OpenAI(
     api_key=OPENAI_API_KEY
@@ -121,7 +124,7 @@ client = OpenAI(
 
 
 # =========================================================
-# LINE API 建立函式
+# LINE API
 # =========================================================
 
 def get_messaging_api():
@@ -147,9 +150,22 @@ def safe_text(text: str, limit: int = 5000) -> str:
     return text[: limit - 3] + "..."
 
 
+def get_event_user_id(event):
+    """
+    從 LINE webhook event 取得 userId。
+    """
+
+    source = getattr(event, "source", None)
+
+    if not source:
+        return None
+
+    return getattr(source, "user_id", None)
+
+
 def reply_text_message(reply_token: str, text: str):
     """
-    回覆單一純文字訊息。
+    回覆單一文字訊息。
     """
 
     api_client, line_bot_api = get_messaging_api()
@@ -165,34 +181,19 @@ def reply_text_message(reply_token: str, text: str):
                 ]
             )
         )
+
     finally:
         api_client.close()
 
 
-def get_event_user_id(event):
-    """
-    從 webhook event 取得 LINE userId。
-
-    群組訊息有時可能沒有 user_id，
-    因此使用 getattr 避免程式錯誤。
-    """
-
-    source = getattr(event, "source", None)
-
-    if not source:
-        return None
-
-    return getattr(source, "user_id", None)
-
-
 # =========================================================
-# 資料庫功能
+# 資料庫
 # =========================================================
 
 def using_postgresql():
     """
-    有設定 DATABASE_URL 時使用 PostgreSQL。
-    沒有設定時，開發環境暫時使用 SQLite。
+    有 DATABASE_URL 時使用 PostgreSQL。
+    沒有時使用本機 SQLite。
     """
 
     return bool(DATABASE_URL)
@@ -200,26 +201,26 @@ def using_postgresql():
 
 def get_database_connection():
     """
-    建立資料庫連線。
-
-    Render 正式環境：
-        使用 PostgreSQL。
-
-    本機測試：
-        沒有 DATABASE_URL 時使用 SQLite。
+    正式 Render 環境使用 PostgreSQL。
+    本機測試可使用 SQLite。
     """
 
     if using_postgresql():
         try:
             import psycopg2
-        except ImportError as exc:
+        except ImportError as error:
             raise RuntimeError(
                 "使用 PostgreSQL 時需要安裝 psycopg2-binary"
-            ) from exc
+            ) from error
 
-        return psycopg2.connect(DATABASE_URL)
+        return psycopg2.connect(
+            DATABASE_URL
+        )
 
-    os.makedirs(local_data_path, exist_ok=True)
+    os.makedirs(
+        local_data_path,
+        exist_ok=True
+    )
 
     connection = sqlite3.connect(
         SQLITE_DB_PATH,
@@ -233,7 +234,7 @@ def get_database_connection():
 
 def init_database():
     """
-    建立使用者身份資料表。
+    建立 LINE 使用者身份資料表。
     """
 
     connection = get_database_connection()
@@ -257,6 +258,7 @@ def init_database():
                 )
                 """
             )
+
         else:
             cursor.execute(
                 """
@@ -280,13 +282,17 @@ def init_database():
             "===== line_users table initialized ====="
         )
 
+    except Exception:
+        connection.rollback()
+        raise
+
     finally:
         connection.close()
 
 
 def get_user_record(user_id: str):
     """
-    依照 LINE userId 查詢使用者資料。
+    依照 LINE userId 查詢身份資料。
     """
 
     if not user_id:
@@ -315,6 +321,7 @@ def get_user_record(user_id: str):
                 """,
                 (user_id,)
             )
+
         else:
             cursor.execute(
                 """
@@ -345,7 +352,9 @@ def get_user_record(user_id: str):
                 for description in cursor.description
             ]
 
-            return dict(zip(columns, row))
+            return dict(
+                zip(columns, row)
+            )
 
         return dict(row)
 
@@ -363,10 +372,10 @@ def save_user_role(
     language: str = None,
 ):
     """
-    儲存使用者身份資料。
+    儲存使用者身份。
 
-    若使用者已存在則更新；
-    若不存在則新增。
+    使用者已存在時更新；
+    不存在時新增。
     """
 
     connection = get_database_connection()
@@ -377,129 +386,133 @@ def save_user_role(
         if using_postgresql():
             cursor.execute(
                 """
-                SELECT user_id
-                FROM line_users
+                INSERT INTO line_users (
+                    user_id,
+                    display_name,
+                    role,
+                    rich_menu_id,
+                    picture_url,
+                    status_message,
+                    language
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    display_name = EXCLUDED.display_name,
+                    role = EXCLUDED.role,
+                    rich_menu_id = EXCLUDED.rich_menu_id,
+                    picture_url = EXCLUDED.picture_url,
+                    status_message = EXCLUDED.status_message,
+                    language = EXCLUDED.language,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    user_id,
+                    display_name,
+                    role,
+                    rich_menu_id,
+                    picture_url,
+                    status_message,
+                    language,
+                )
+            )
+
+        else:
+            cursor.execute(
+                """
+                INSERT INTO line_users (
+                    user_id,
+                    display_name,
+                    role,
+                    rich_menu_id,
+                    picture_url,
+                    status_message,
+                    language
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+
+                ON CONFLICT(user_id)
+                DO UPDATE SET
+                    display_name = excluded.display_name,
+                    role = excluded.role,
+                    rich_menu_id = excluded.rich_menu_id,
+                    picture_url = excluded.picture_url,
+                    status_message = excluded.status_message,
+                    language = excluded.language,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    user_id,
+                    display_name,
+                    role,
+                    rich_menu_id,
+                    picture_url,
+                    status_message,
+                    language,
+                )
+            )
+
+        connection.commit()
+
+        app.logger.info(
+            "===== user role saved ===== "
+            f"user_id={user_id}, role={role}"
+        )
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
+
+
+def delete_user_record(user_id: str) -> bool:
+    """
+    使用者封鎖 LINE Bot 時，
+    刪除其身份紀錄。
+
+    下次解除封鎖時，
+    系統就會再次顯示身份選擇。
+    """
+
+    if not user_id:
+        return False
+
+    connection = get_database_connection()
+
+    try:
+        cursor = connection.cursor()
+
+        if using_postgresql():
+            cursor.execute(
+                """
+                DELETE FROM line_users
                 WHERE user_id = %s
                 """,
                 (user_id,)
             )
+
         else:
             cursor.execute(
                 """
-                SELECT user_id
-                FROM line_users
+                DELETE FROM line_users
                 WHERE user_id = ?
                 """,
                 (user_id,)
             )
 
-        existing_user = cursor.fetchone()
-
-        if existing_user:
-            if using_postgresql():
-                cursor.execute(
-                    """
-                    UPDATE line_users
-                    SET
-                        display_name = %s,
-                        role = %s,
-                        rich_menu_id = %s,
-                        picture_url = %s,
-                        status_message = %s,
-                        language = %s,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE user_id = %s
-                    """,
-                    (
-                        display_name,
-                        role,
-                        rich_menu_id,
-                        picture_url,
-                        status_message,
-                        language,
-                        user_id,
-                    )
-                )
-            else:
-                cursor.execute(
-                    """
-                    UPDATE line_users
-                    SET
-                        display_name = ?,
-                        role = ?,
-                        rich_menu_id = ?,
-                        picture_url = ?,
-                        status_message = ?,
-                        language = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE user_id = ?
-                    """,
-                    (
-                        display_name,
-                        role,
-                        rich_menu_id,
-                        picture_url,
-                        status_message,
-                        language,
-                        user_id,
-                    )
-                )
-
-        else:
-            if using_postgresql():
-                cursor.execute(
-                    """
-                    INSERT INTO line_users (
-                        user_id,
-                        display_name,
-                        role,
-                        rich_menu_id,
-                        picture_url,
-                        status_message,
-                        language
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        user_id,
-                        display_name,
-                        role,
-                        rich_menu_id,
-                        picture_url,
-                        status_message,
-                        language,
-                    )
-                )
-            else:
-                cursor.execute(
-                    """
-                    INSERT INTO line_users (
-                        user_id,
-                        display_name,
-                        role,
-                        rich_menu_id,
-                        picture_url,
-                        status_message,
-                        language
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        user_id,
-                        display_name,
-                        role,
-                        rich_menu_id,
-                        picture_url,
-                        status_message,
-                        language,
-                    )
-                )
+        deleted = cursor.rowcount > 0
 
         connection.commit()
 
         app.logger.info(
-            f"===== user role saved: {user_id}, {role} ====="
+            "===== user record deleted ===== "
+            f"user_id={user_id}, deleted={deleted}"
         )
+
+        return deleted
 
     except Exception:
         connection.rollback()
@@ -515,15 +528,14 @@ def save_user_role(
 
 def create_role_selection_message():
     """
-    建立首次加入好友時顯示的身份選擇按鈕。
+    建立家屬、看護、長者的身份選擇按鈕。
     """
 
     return TextMessage(
         text=(
             "歡迎使用長照用藥 Bot！\n\n"
-            "請選擇您的身份類別。\n"
-            "身份確認後將自動載入對應功能選單，"
-            "且設定完成後不可重複選擇。"
+            "請先選擇您的身份類別。\n"
+            "選擇後，系統會自動載入對應的功能選單。"
         ),
         quick_reply=QuickReply(
             items=[
@@ -534,6 +546,7 @@ def create_role_selection_message():
                         display_text="我是家屬"
                     )
                 ),
+
                 QuickReplyItem(
                     action=PostbackAction(
                         label="看護",
@@ -541,6 +554,7 @@ def create_role_selection_message():
                         display_text="我是看護"
                     )
                 ),
+
                 QuickReplyItem(
                     action=PostbackAction(
                         label="長者",
@@ -555,7 +569,7 @@ def create_role_selection_message():
 
 def reply_role_selection(reply_token: str):
     """
-    回覆身份選擇按鈕。
+    回覆身份選擇訊息。
     """
 
     api_client, line_bot_api = get_messaging_api()
@@ -579,6 +593,54 @@ def reply_role_selection(reply_token: str):
 
 
 # =========================================================
+# LINE Profile
+# =========================================================
+
+def get_line_profile(user_id: str):
+    """
+    取得 LINE 使用者個人資料。
+    """
+
+    api_client, line_bot_api = get_messaging_api()
+
+    try:
+        profile = line_bot_api.get_profile(
+            user_id=user_id
+        )
+
+        return {
+            "user_id": user_id,
+
+            "display_name": getattr(
+                profile,
+                "display_name",
+                ""
+            ),
+
+            "picture_url": getattr(
+                profile,
+                "picture_url",
+                None
+            ),
+
+            "status_message": getattr(
+                profile,
+                "status_message",
+                None
+            ),
+
+            "language": getattr(
+                profile,
+                "language",
+                None
+            ),
+        }
+
+    finally:
+        api_client.close()
+
+
+# =========================================================
 # Rich Menu 綁定
 # =========================================================
 
@@ -587,14 +649,13 @@ def link_rich_menu_to_user(
     rich_menu_id: str
 ):
     """
-    將指定 Rich Menu 綁定到指定 LINE 使用者。
-
-    綁定後，該使用者的個人 Rich Menu
-    會覆蓋 LINE Official Account 的預設 Rich Menu。
+    將指定 Rich Menu 綁定給指定使用者。
     """
 
     if not user_id:
-        raise ValueError("缺少 LINE userId")
+        raise ValueError(
+            "缺少 LINE userId"
+        )
 
     if not rich_menu_id:
         raise ValueError(
@@ -608,7 +669,9 @@ def link_rich_menu_to_user(
     )
 
     headers = {
-        "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
+        "Authorization": (
+            f"Bearer {CHANNEL_ACCESS_TOKEN}"
+        )
     }
 
     response = requests.post(
@@ -632,58 +695,7 @@ def link_rich_menu_to_user(
 
 
 # =========================================================
-# 取得 LINE Profile
-# =========================================================
-
-def get_line_profile(user_id: str):
-    """
-    取得使用者的 LINE Profile。
-
-    可取得：
-    - user_id
-    - display_name
-    - picture_url
-    - status_message
-    - language
-    """
-
-    api_client, line_bot_api = get_messaging_api()
-
-    try:
-        profile = line_bot_api.get_profile(
-            user_id=user_id
-        )
-
-        return {
-            "user_id": user_id,
-            "display_name": getattr(
-                profile,
-                "display_name",
-                ""
-            ),
-            "picture_url": getattr(
-                profile,
-                "picture_url",
-                None
-            ),
-            "status_message": getattr(
-                profile,
-                "status_message",
-                None
-            ),
-            "language": getattr(
-                profile,
-                "language",
-                None
-            ),
-        }
-
-    finally:
-        api_client.close()
-
-
-# =========================================================
-# OpenAI 回覆
+# OpenAI
 # =========================================================
 
 def gpt_response(user_text: str) -> str:
@@ -799,20 +811,19 @@ def callback():
 
 
 # =========================================================
-# 首次加入好友
+# 加入好友
 # =========================================================
 
 @handler.add(FollowEvent)
 def handle_follow(event):
     """
-    使用者加入好友或解除封鎖時觸發。
+    使用者加入好友或解除封鎖時執行。
 
     資料庫沒有身份：
         顯示身份選擇。
 
-    已經有身份：
-        不再顯示身份選擇，
-        重新綁定原本的 Rich Menu。
+    資料庫已有身份：
+        恢復原本的 Rich Menu。
     """
 
     app.logger.info(
@@ -828,27 +839,39 @@ def handle_follow(event):
         return
 
     try:
-        user_record = get_user_record(user_id)
+        app.logger.info(
+            f"===== Follow user_id: {user_id} ====="
+        )
 
+        user_record = get_user_record(
+            user_id
+        )
+
+        app.logger.info(
+            "===== Existing user record ===== "
+            f"{user_record}"
+        )
+
+        # 沒有身份紀錄，顯示身份選擇
         if not user_record:
             reply_role_selection(
                 event.reply_token
             )
-
             return
 
-        role = user_record.get("role")
-        role_setting = ROLE_CONFIG.get(role)
+        role = user_record.get(
+            "role"
+        )
 
+        role_setting = ROLE_CONFIG.get(
+            role
+        )
+
+        # 資料庫身份異常，重新選擇
         if not role_setting:
-            app.logger.warning(
-                f"Unknown stored role: {role}"
-            )
-
             reply_role_selection(
                 event.reply_token
             )
-
             return
 
         rich_menu_id = role_setting.get(
@@ -865,14 +888,12 @@ def handle_follow(event):
             or "使用者"
         )
 
-        role_name = role_setting["name"]
-
         reply_text_message(
             event.reply_token,
             (
                 f"{display_name}，歡迎回來！\n"
-                f"目前身份：{role_name}\n"
-                "已經為您載入原本的功能選單。"
+                f"目前身份：{role_setting['name']}\n"
+                "已為您載入原本的功能選單。"
             )
         )
 
@@ -890,10 +911,60 @@ def handle_follow(event):
                 event.reply_token,
                 "系統初始化失敗，請稍後再試。"
             )
+
         except Exception:
             app.logger.error(
                 traceback.format_exc()
             )
+
+
+# =========================================================
+# 使用者封鎖官方帳號
+# =========================================================
+
+@handler.add(UnfollowEvent)
+def handle_unfollow(event):
+    """
+    使用者封鎖官方帳號時執行。
+
+    UnfollowEvent 沒有 reply_token，
+    所以不能傳訊息給使用者。
+
+    這裡會刪除資料庫中的身份紀錄，
+    讓使用者下次解除封鎖後重新選擇身份。
+    """
+
+    app.logger.info(
+        "===== UnfollowEvent triggered ====="
+    )
+
+    user_id = get_event_user_id(event)
+
+    if not user_id:
+        app.logger.warning(
+            "===== UnfollowEvent has no user_id ====="
+        )
+        return
+
+    try:
+        deleted = delete_user_record(
+            user_id
+        )
+
+        app.logger.info(
+            "===== unfollow cleanup completed ===== "
+            f"user_id={user_id}, "
+            f"deleted={deleted}"
+        )
+
+    except Exception:
+        app.logger.error(
+            "===== handle_unfollow exception ====="
+        )
+
+        app.logger.error(
+            traceback.format_exc()
+        )
 
 
 # =========================================================
@@ -920,9 +991,11 @@ def handle_text_message(event):
     user_id = get_event_user_id(event)
 
     try:
-        # 私人聊天室且還沒有設定身份
+        # 私人聊天室中，未設定身份者先選身份
         if user_id:
-            user_record = get_user_record(user_id)
+            user_record = get_user_record(
+                user_id
+            )
 
             if not user_record:
                 app.logger.info(
@@ -975,15 +1048,14 @@ def handle_text_message(event):
             traceback.format_exc()
         )
 
-        error_text = safe_text(
-            f"系統錯誤：{str(error)}"
-        )
-
         try:
             reply_text_message(
                 event.reply_token,
-                error_text
+                safe_text(
+                    f"系統錯誤：{str(error)}"
+                )
             )
+
         except Exception:
             app.logger.error(
                 traceback.format_exc()
@@ -1000,10 +1072,6 @@ def handle_text_message(event):
 )
 def handle_image_message(event):
     app.logger.info(
-        "===== NEW IMAGE HANDLER VERSION 20260624 ====="
-    )
-
-    app.logger.info(
         "===== handle_image_message triggered ====="
     )
 
@@ -1011,16 +1079,14 @@ def handle_image_message(event):
         f"image message id: {event.message.id}"
     )
 
-    app.logger.info(
-        f"reply token exists: {bool(event.reply_token)}"
-    )
-
     user_id = get_event_user_id(event)
 
     try:
-        # 未設定身份者先要求設定身份
+        # 尚未設定身份，不處理圖片
         if user_id:
-            user_record = get_user_record(user_id)
+            user_record = get_user_record(
+                user_id
+            )
 
             if not user_record:
                 reply_role_selection(
@@ -1048,41 +1114,25 @@ def handle_image_message(event):
                 )
             )
 
-            with open(image_path, "wb") as file:
-                file.write(message_content)
+            with open(
+                image_path,
+                "wb"
+            ) as file:
+                file.write(
+                    message_content
+                )
 
         finally:
             api_client_blob.close()
 
-        api_client_msg, line_bot_api = (
-            get_messaging_api()
+        reply_text_message(
+            event.reply_token,
+            "已收到藥袋圖片，接下來會進行 AI 辨識。"
         )
 
-        try:
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[
-                        TextMessage(
-                            text=(
-                                "已收到藥袋圖片，"
-                                "接下來會進行 AI 辨識。"
-                            )
-                        )
-                    ]
-                )
-            )
-
-            app.logger.info(
-                f"===== image saved: {image_path} ====="
-            )
-
-            app.logger.info(
-                "===== image reply sent ====="
-            )
-
-        finally:
-            api_client_msg.close()
+        app.logger.info(
+            f"===== image saved: {image_path} ====="
+        )
 
     except Exception:
         app.logger.error(
@@ -1098,6 +1148,7 @@ def handle_image_message(event):
                 event.reply_token,
                 "圖片處理失敗，請查看後台 log。"
             )
+
         except Exception:
             app.logger.error(
                 traceback.format_exc()
@@ -1105,7 +1156,7 @@ def handle_image_message(event):
 
 
 # =========================================================
-# Postback：處理身份選擇
+# Postback：身份選擇
 # =========================================================
 
 @handler.add(PostbackEvent)
@@ -1114,14 +1165,19 @@ def handle_postback(event):
         "===== PostbackEvent triggered ====="
     )
 
-    postback_data = event.postback.data or ""
+    postback_data = (
+        event.postback.data
+        or ""
+    )
 
     app.logger.info(
         f"Postback data: {postback_data}"
     )
 
     try:
-        params = parse_qs(postback_data)
+        params = parse_qs(
+            postback_data
+        )
 
         action = params.get(
             "action",
@@ -1138,6 +1194,7 @@ def handle_postback(event):
             app.logger.info(
                 "===== unrelated postback ignored ====="
             )
+
             return
 
         user_id = get_event_user_id(event)
@@ -1145,29 +1202,27 @@ def handle_postback(event):
         if not user_id:
             reply_text_message(
                 event.reply_token,
-                "無法取得您的 LINE Profile ID。"
+                "無法取得您的 LINE User ID。"
             )
 
             return
 
-        # 防止使用者重複點擊舊的身份按鈕
-        existing_user = get_user_record(user_id)
+        # 防止重複點擊身份按鈕
+        existing_user = get_user_record(
+            user_id
+        )
 
         if existing_user:
             existing_role = existing_user.get(
                 "role"
             )
 
-            existing_role_setting = ROLE_CONFIG.get(
+            existing_role_name = ROLE_CONFIG.get(
                 existing_role,
                 {}
-            )
-
-            existing_role_name = (
-                existing_role_setting.get(
-                    "name",
-                    existing_role
-                )
+            ).get(
+                "name",
+                existing_role
             )
 
             reply_text_message(
@@ -1176,7 +1231,7 @@ def handle_postback(event):
                     "您的身份已經設定完成，"
                     "不需要再次選擇。\n\n"
                     f"目前身份：{existing_role_name}\n"
-                    f"LINE Profile ID：\n{user_id}"
+                    f"LINE User ID：\n{user_id}"
                 )
             )
 
@@ -1190,42 +1245,54 @@ def handle_postback(event):
 
             return
 
-        role_setting = ROLE_CONFIG[role]
+        role_setting = ROLE_CONFIG[
+            role
+        ]
 
-        role_name = role_setting["name"]
-        rich_menu_id = role_setting["rich_menu_id"]
+        role_name = role_setting[
+            "name"
+        ]
+
+        rich_menu_id = role_setting[
+            "rich_menu_id"
+        ]
 
         if not rich_menu_id:
             raise ValueError(
                 f"{role_name}尚未設定 Rich Menu ID。"
             )
 
-        # 取得 LINE Profile
-        profile_data = get_line_profile(user_id)
+        # 取得 LINE 個人資料
+        profile_data = get_line_profile(
+            user_id
+        )
 
         display_name = (
             profile_data.get("display_name")
             or "使用者"
         )
 
-        # 先綁定 Rich Menu
+        # 綁定身份對應的 Rich Menu
         link_rich_menu_to_user(
             user_id=user_id,
             rich_menu_id=rich_menu_id
         )
 
-        # 綁定成功後才寫入資料庫
+        # 儲存身份與個人資料
         save_user_role(
             user_id=user_id,
             display_name=display_name,
             role=role,
             rich_menu_id=rich_menu_id,
+
             picture_url=profile_data.get(
                 "picture_url"
             ),
+
             status_message=profile_data.get(
                 "status_message"
             ),
+
             language=profile_data.get(
                 "language"
             ),
@@ -1237,7 +1304,7 @@ def handle_postback(event):
                 "身份設定完成！\n\n"
                 f"名稱：{display_name}\n"
                 f"身份：{role_name}\n"
-                f"LINE Profile ID：\n{user_id}\n\n"
+                f"LINE User ID：\n{user_id}\n\n"
                 f"已載入「{role_name}」專用功能選單。"
             )
         )
@@ -1264,6 +1331,7 @@ def handle_postback(event):
                     f"身份設定失敗：{str(error)}"
                 )
             )
+
         except Exception:
             app.logger.error(
                 traceback.format_exc()
@@ -1285,11 +1353,11 @@ def welcome(event):
             event.joined.members[0].user_id
         )
 
-        group_id = event.source.group_id
-
-        api_client, line_bot_api = (
-            get_messaging_api()
+        group_id = (
+            event.source.group_id
         )
+
+        api_client, line_bot_api = get_messaging_api()
 
         try:
             profile = (
@@ -1337,7 +1405,9 @@ def welcome(event):
 
 @app.route("/test-push", methods=["GET"])
 def test_push():
-    user_id = request.args.get("to")
+    user_id = request.args.get(
+        "to"
+    )
 
     text = request.args.get(
         "text",
@@ -1345,11 +1415,12 @@ def test_push():
     )
 
     if not user_id:
-        return "請帶 ?to=LINE_USER_ID", 400
+        return (
+            "請帶 ?to=LINE_USER_ID",
+            400
+        )
 
-    api_client, line_bot_api = (
-        get_messaging_api()
-    )
+    api_client, line_bot_api = get_messaging_api()
 
     try:
         line_bot_api.push_message(
@@ -1384,21 +1455,20 @@ def test_push():
 
 
 # =========================================================
-# 查看使用者資料測試
+# 查詢使用者資料測試
 # =========================================================
 
 @app.route("/test-user", methods=["GET"])
 def test_user():
     """
-    測試網址：
+    測試：
 
     /test-user?user_id=Uxxxxxxxx
-
-    正式環境若會公開使用，
-    建議之後加上管理員權限驗證。
     """
 
-    user_id = request.args.get("user_id")
+    user_id = request.args.get(
+        "user_id"
+    )
 
     if not user_id:
         return {
@@ -1406,7 +1476,9 @@ def test_user():
             "message": "請帶入 user_id"
         }, 400
 
-    user_record = get_user_record(user_id)
+    user_record = get_user_record(
+        user_id
+    )
 
     if not user_record:
         return {
@@ -1414,8 +1486,9 @@ def test_user():
             "message": "找不到使用者"
         }, 404
 
-    # 避免 datetime 無法直接轉成 JSON
-    for key, value in list(user_record.items()):
+    for key, value in list(
+        user_record.items()
+    ):
         if value is not None:
             user_record[key] = str(value)
 
@@ -1426,13 +1499,61 @@ def test_user():
 
 
 # =========================================================
-# 啟動程式
+# 手動刪除測試使用者
 # =========================================================
 
-# Gunicorn 啟動時不會執行 __main__，
-# 所以資料庫初始化要放在外面。
+@app.route("/test-delete-user", methods=["GET"])
+def test_delete_user():
+    """
+    測試階段手動刪除使用者身份。
+
+    使用方式：
+
+    /test-delete-user?user_id=Uxxxxxxxx
+
+    正式上線前建議刪除這個路由，
+    或加入管理員密碼驗證。
+    """
+
+    user_id = request.args.get(
+        "user_id"
+    )
+
+    if not user_id:
+        return {
+            "success": False,
+            "message": "請帶入 user_id"
+        }, 400
+
+    try:
+        deleted = delete_user_record(
+            user_id
+        )
+
+        return {
+            "success": True,
+            "deleted": deleted,
+            "user_id": user_id
+        }, 200
+
+    except Exception as error:
+        app.logger.error(
+            traceback.format_exc()
+        )
+
+        return {
+            "success": False,
+            "message": str(error)
+        }, 500
+
+
+# =========================================================
+# 初始化資料庫
+# =========================================================
+
 try:
     init_database()
+
 except Exception:
     app.logger.error(
         "===== database initialization failed ====="
@@ -1444,6 +1565,10 @@ except Exception:
 
     raise
 
+
+# =========================================================
+# 啟動
+# =========================================================
 
 if __name__ == "__main__":
     port = int(
