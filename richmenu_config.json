@@ -5,7 +5,7 @@
       "name": "家屬主選單",
       "chatBarText": "家屬功能",
       "selected": true,
-      "image": "static/richmenu/family.png",
+      "image": "static/family/family_main_menu.png.png",
       "areas": [
         {
           "bounds": {
@@ -86,7 +86,7 @@
       "name": "看護主選單",
       "chatBarText": "看護功能",
       "selected": true,
-      "image": "static/richmenu/caregiver.png",
+      "image": "static/caregiver/id/caregiver_patient_selector_menu.png",
       "areas": [
         {
           "bounds": {
@@ -167,7 +167,7 @@
       "name": "長者主選單",
       "chatBarText": "長者功能",
       "selected": true,
-      "image": "static/richmenu/elderly.png",
+      "image": "static/patient/elder_main_menu.png",
       "areas": [
         {
           "bounds": {
