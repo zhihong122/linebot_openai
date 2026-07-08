@@ -62,6 +62,12 @@ FAMILY_RICH_MENU_ID = os.getenv("FAMILY_RICH_MENU_ID")
 CAREGIVER_RICH_MENU_ID = os.getenv("CAREGIVER_RICH_MENU_ID")
 ELDERLY_RICH_MENU_ID = os.getenv("ELDERLY_RICH_MENU_ID")
 
+# 調試用：設為 true 時，Render 啟動時會自動把家屬 Rich Menu 設為 Default
+# 建議測試完改回 false，避免正式環境所有新使用者都直接看到家屬選單
+FORCE_FAMILY_DEFAULT_RICH_MENU = (
+    os.getenv("FORCE_FAMILY_DEFAULT_RICH_MENU", "false").lower() == "true"
+)
+
 
 if not CHANNEL_ACCESS_TOKEN:
     raise ValueError("缺少 CHANNEL_ACCESS_TOKEN")
@@ -565,6 +571,47 @@ def link_rich_menu_to_user(user_id: str, rich_menu_id: str) -> bool:
     return True
 
 
+def set_default_rich_menu(rich_menu_id: str) -> bool:
+    """
+    將指定 Rich Menu 設為 Default。
+    調試家屬選單時，可把 FAMILY_RICH_MENU_ID 設成 Default。
+    """
+
+    if not rich_menu_id:
+        raise ValueError("缺少 Rich Menu ID，請先在 Render 設定 FAMILY_RICH_MENU_ID")
+
+    api_client, line_bot_api = get_messaging_api()
+
+    try:
+        line_bot_api.set_default_rich_menu(rich_menu_id)
+
+        app.logger.info(
+            "===== default rich menu set ===== "
+            f"rich_menu_id={rich_menu_id}"
+        )
+
+        return True
+
+    finally:
+        api_client.close()
+
+
+def get_default_rich_menu_id():
+    """
+    查詢目前 Default Rich Menu ID。
+    若尚未設定 Default，LINE API 可能會回傳錯誤。
+    """
+
+    api_client, line_bot_api = get_messaging_api()
+
+    try:
+        result = line_bot_api.get_default_rich_menu_id()
+        return getattr(result, "rich_menu_id", None)
+
+    finally:
+        api_client.close()
+
+
 # =========================================================
 # OpenAI
 # =========================================================
@@ -613,6 +660,64 @@ def home():
         "LINE Bot is running. "
         f"Database: {database_name}"
     )
+
+
+@app.route("/test-set-family-default", methods=["GET"])
+def test_set_family_default():
+    """
+    測試用：
+    將家屬主選單設為 Default Rich Menu。
+    使用前請先在 Render 設定 FAMILY_RICH_MENU_ID。
+    """
+
+    try:
+        if not FAMILY_RICH_MENU_ID:
+            return {
+                "success": False,
+                "message": "尚未設定 FAMILY_RICH_MENU_ID，請先把 family_main_id 放到 Render 環境變數。"
+            }, 400
+
+        set_default_rich_menu(FAMILY_RICH_MENU_ID)
+
+        return {
+            "success": True,
+            "message": "已將家屬 Rich Menu 設為 Default。",
+            "family_rich_menu_id": FAMILY_RICH_MENU_ID
+        }, 200
+
+    except Exception as error:
+        app.logger.error("===== test_set_family_default error =====")
+        app.logger.error(traceback.format_exc())
+
+        return {
+            "success": False,
+            "message": str(error)
+        }, 500
+
+
+@app.route("/test-default-richmenu", methods=["GET"])
+def test_default_richmenu():
+    """
+    測試用：
+    查詢目前 Default Rich Menu ID。
+    """
+
+    try:
+        rich_menu_id = get_default_rich_menu_id()
+
+        return {
+            "success": True,
+            "default_rich_menu_id": rich_menu_id
+        }, 200
+
+    except Exception as error:
+        app.logger.error("===== test_default_richmenu error =====")
+        app.logger.error(traceback.format_exc())
+
+        return {
+            "success": False,
+            "message": str(error)
+        }, 500
 
 
 @app.route("/callback", methods=["POST"])
@@ -1160,6 +1265,21 @@ def test_delete_user():
 # =========================================================
 # 初始化資料庫
 # =========================================================
+
+try:
+    if FORCE_FAMILY_DEFAULT_RICH_MENU and FAMILY_RICH_MENU_ID:
+        set_default_rich_menu(FAMILY_RICH_MENU_ID)
+        app.logger.info(
+            "===== FORCE_FAMILY_DEFAULT_RICH_MENU enabled ===== "
+            f"family_rich_menu_id={FAMILY_RICH_MENU_ID}"
+        )
+
+except Exception:
+    app.logger.error(
+        "===== set family default rich menu failed ====="
+    )
+    app.logger.error(traceback.format_exc())
+
 
 try:
     init_database()
