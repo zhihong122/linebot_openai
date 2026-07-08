@@ -23,7 +23,7 @@ with ApiClient(configuration) as api_client:
     line_bot_blob_api = MessagingApiBlob(api_client)
 
     # GitHub 圖片 raw 路徑
-    base_url = "https://raw.githubusercontent.com/zhihong122/linebot_openai/master/static/patient"
+    base_url = "https://raw.githubusercontent.com/zhihong122/linebot_openai/master/static/patient/"
 
     # ============================== 長者主選單 ==============================
     rich_menu_main_str = """{
