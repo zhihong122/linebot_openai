@@ -22,7 +22,7 @@ with ApiClient(configuration) as api_client:
     line_bot_api = MessagingApi(api_client)
     line_bot_blob_api = MessagingApiBlob(api_client)
 
-    base_url = "https://raw.githubusercontent.com/zhihong122/linebot_openai/master/static/caregiver/en/"
+    base_url = "https://raw.githubusercontent.com/zhihong122/linebot_openai/master/static/caregiver/en"
 
     # ============================== 看護主選單：患者選擇 ==============================
     rich_menu_main_str = """{
