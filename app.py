@@ -7,6 +7,8 @@ from urllib.parse import parse_qs
 import requests
 from openai import OpenAI
 
+from richmenu_manager import get_home_rich_menu_id
+
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -40,9 +42,20 @@ CHANNEL_SECRET = os.getenv("CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-FAMILY_RICH_MENU_ID = os.getenv("FAMILY_RICH_MENU_ID")
-CAREGIVER_RICH_MENU_ID = os.getenv("CAREGIVER_RICH_MENU_ID")
-ELDERLY_RICH_MENU_ID = os.getenv("ELDERLY_RICH_MENU_ID")
+FAMILY_RICH_MENU_ID = (
+    os.getenv("FAMILY_RICH_MENU_ID")
+    or get_home_rich_menu_id("family")
+)
+
+CAREGIVER_RICH_MENU_ID = (
+    os.getenv("CAREGIVER_RICH_MENU_ID")
+    or get_home_rich_menu_id("caregiver")
+)
+
+ELDERLY_RICH_MENU_ID = (
+    os.getenv("ELDERLY_RICH_MENU_ID")
+    or get_home_rich_menu_id("elderly")
+)
 
 required_env = {
     "CHANNEL_ACCESS_TOKEN": CHANNEL_ACCESS_TOKEN,
