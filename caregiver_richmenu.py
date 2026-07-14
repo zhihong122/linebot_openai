@@ -1,10 +1,10 @@
+import os
+
 from richmenu_common import create_rich_menu_set
 
 
-BASE_URL = (
-    "https://raw.githubusercontent.com/"
-    "zhihong122/linebot_openai/master/static/caregiver/en"
-)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+IMAGE_DIR = os.path.join(BASE_DIR, "static", *"caregiver/en".split("/"))
 
 
 MENU_DEFINITIONS = {
@@ -239,7 +239,7 @@ MENU_DEFINITIONS = {
 def create_caregiver_richmenus():
     menu_ids = create_rich_menu_set(
         role_name="caregiver",
-        base_url=BASE_URL,
+        image_dir=IMAGE_DIR,
         menu_definitions=MENU_DEFINITIONS,
     )
 
