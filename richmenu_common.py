@@ -1,5 +1,6 @@
 import json
 import os
+import mimetypes
 import requests
 
 from linebot.v3.messaging import (
@@ -16,12 +17,9 @@ CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN")
 if not CHANNEL_ACCESS_TOKEN:
     raise ValueError("缺少 CHANNEL_ACCESS_TOKEN")
 
-
-configuration = Configuration(
-    access_token=CHANNEL_ACCESS_TOKEN
-)
-
+configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 API_BASE = "https://api.line.me/v2/bot"
+MAX_IMAGE_BYTES = 1024 * 1024
 
 
 def _request(method, url, **kwargs):
@@ -34,41 +32,41 @@ def _request(method, url, **kwargs):
 
     if response.status_code not in (200, 201):
         raise RuntimeError(
-            f"LINE API 請求失敗：HTTP {response.status_code} "
-            f"{response.text}"
+            f"LINE API 請求失敗：HTTP {response.status_code} {response.text}"
         )
 
     return response
 
 
 def create_or_update_alias(alias_id, rich_menu_id):
-    headers = {
-        "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
+    auth_headers = {
+        "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
+    }
+    json_headers = {
+        **auth_headers,
         "Content-Type": "application/json",
     }
 
-    get_response = requests.get(
+    response = requests.get(
         f"{API_BASE}/richmenu/alias/{alias_id}",
-        headers={
-            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
-        },
+        headers=auth_headers,
         timeout=20,
     )
 
-    if get_response.status_code == 200:
+    if response.status_code == 200:
         _request(
             "POST",
             f"{API_BASE}/richmenu/alias/{alias_id}",
-            headers=headers,
+            headers=json_headers,
             json={"richMenuId": rich_menu_id},
         )
         return "updated"
 
-    if get_response.status_code == 404:
+    if response.status_code == 404:
         _request(
             "POST",
             f"{API_BASE}/richmenu/alias",
-            headers=headers,
+            headers=json_headers,
             json={
                 "richMenuAliasId": alias_id,
                 "richMenuId": rich_menu_id,
@@ -78,41 +76,91 @@ def create_or_update_alias(alias_id, rich_menu_id):
 
     raise RuntimeError(
         "查詢 Rich Menu Alias 失敗："
-        f"HTTP {get_response.status_code} {get_response.text}"
+        f"HTTP {response.status_code} {response.text}"
     )
 
 
-def download_image(image_url):
-    response = requests.get(
-        image_url,
-        timeout=60,
-    )
+def validate_rich_menu_images(image_dir, menu_definitions):
+    errors = []
+    checked = []
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            "下載 Rich Menu 圖片失敗："
-            f"HTTP {response.status_code} {response.text}"
+    for menu_key, definition in menu_definitions.items():
+        image_path = os.path.join(image_dir, definition["image"])
+
+        if not os.path.isfile(image_path):
+            errors.append(
+                f"[{menu_key}] 找不到圖片：{image_path}"
+            )
+            continue
+
+        image_size = os.path.getsize(image_path)
+        extension = os.path.splitext(image_path)[1].lower()
+
+        if extension not in (".jpg", ".jpeg", ".png"):
+            errors.append(
+                f"[{menu_key}] 圖片格式不支援：{image_path}"
+            )
+            continue
+
+        if image_size > MAX_IMAGE_BYTES:
+            errors.append(
+                f"[{menu_key}] 圖片超過 1 MB：{image_path} "
+                f"({image_size / 1024:.1f} KB)"
+            )
+            continue
+
+        checked.append(
+            f"[{menu_key}] {image_path} ({image_size / 1024:.1f} KB)"
         )
 
-    content_type = response.headers.get(
-        "Content-Type",
-        "image/png",
-    ).split(";")[0]
+    if errors:
+        raise RuntimeError(
+            "Rich Menu 圖片預檢失敗，尚未建立任何選單：\n- "
+            + "\n- ".join(errors)
+        )
 
-    if content_type not in (
-        "image/png",
-        "image/jpeg",
-    ):
+    return checked
+
+
+def read_image(image_path):
+    extension = os.path.splitext(image_path)[1].lower()
+
+    if extension in (".jpg", ".jpeg"):
+        content_type = "image/jpeg"
+    elif extension == ".png":
         content_type = "image/png"
+    else:
+        content_type = mimetypes.guess_type(image_path)[0]
 
-    return response.content, content_type
+    if content_type not in ("image/jpeg", "image/png"):
+        raise ValueError(f"不支援的圖片格式：{image_path}")
+
+    with open(image_path, "rb") as image_file:
+        image_bytes = image_file.read()
+
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise RuntimeError(
+            f"Rich Menu 圖片超過 1 MB：{image_path} "
+            f"({len(image_bytes) / 1024:.1f} KB)"
+        )
+
+    return image_bytes, content_type
 
 
 def create_rich_menu_set(
     role_name,
-    base_url,
+    image_dir,
     menu_definitions,
 ):
+    checked = validate_rich_menu_images(
+        image_dir=image_dir,
+        menu_definitions=menu_definitions,
+    )
+
+    print(f"[{role_name}] 圖片預檢完成：")
+    for item in checked:
+        print(f"  {item}")
+
     created_ids = {}
 
     with ApiClient(configuration) as api_client:
@@ -131,30 +179,38 @@ def create_rich_menu_set(
                 rich_menu_request=menu_request
             ).rich_menu_id
 
-            image_bytes, content_type = download_image(
-                f"{base_url}/{definition['image']}"
-            )
+            try:
+                image_path = os.path.join(
+                    image_dir,
+                    definition["image"],
+                )
+                image_bytes, content_type = read_image(image_path)
 
-            blob_api.set_rich_menu_image(
-                rich_menu_id=rich_menu_id,
-                body=image_bytes,
-                _headers={
-                    "Content-Type": content_type
-                },
-            )
+                blob_api.set_rich_menu_image(
+                    rich_menu_id=rich_menu_id,
+                    body=image_bytes,
+                    _headers={"Content-Type": content_type},
+                )
 
-            alias_status = create_or_update_alias(
-                definition["alias"],
-                rich_menu_id,
-            )
+                alias_status = create_or_update_alias(
+                    definition["alias"],
+                    rich_menu_id,
+                )
 
-            created_ids[menu_key] = rich_menu_id
+                created_ids[menu_key] = rich_menu_id
 
-            print(
-                f"[{role_name}] {menu_key}: "
-                f"{rich_menu_id} "
-                f"(alias {alias_status}: "
-                f"{definition['alias']})"
-            )
+                print(
+                    f"[{role_name}] {menu_key}: {rich_menu_id} "
+                    f"(alias {alias_status}: {definition['alias']})"
+                )
+
+            except Exception:
+                try:
+                    messaging_api.delete_rich_menu(
+                        rich_menu_id=rich_menu_id
+                    )
+                except Exception:
+                    pass
+                raise
 
     return created_ids
