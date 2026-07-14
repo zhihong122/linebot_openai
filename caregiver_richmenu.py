@@ -3,7 +3,7 @@ from richmenu_common import create_rich_menu_set
 
 BASE_URL = (
     "https://raw.githubusercontent.com/"
-    "zhihong122/linebot_openai/master/static/caregiver"
+    "zhihong122/linebot_openai/master/static/caregiver/en"
 )
 
 
@@ -69,12 +69,8 @@ MENU_DEFINITIONS = {
                     },
                     "action": {
                         "type": "richmenuswitch",
-                        "richMenuAliasId": (
-                            "caregiver_patient1_today_tasks"
-                        ),
-                        "data": (
-                            "switch-to-caregiver-patient1-today-tasks"
-                        ),
+                        "richMenuAliasId": "caregiver_patient1_today_tasks",
+                        "data": "switch-to-caregiver-patient1-today-tasks",
                     },
                 },
                 {
@@ -86,12 +82,8 @@ MENU_DEFINITIONS = {
                     },
                     "action": {
                         "type": "richmenuswitch",
-                        "richMenuAliasId": (
-                            "caregiver_patient1_checklist"
-                        ),
-                        "data": (
-                            "switch-to-caregiver-patient1-checklist"
-                        ),
+                        "richMenuAliasId": "caregiver_patient1_checklist",
+                        "data": "switch-to-caregiver-patient1-checklist",
                     },
                 },
                 {
@@ -103,12 +95,8 @@ MENU_DEFINITIONS = {
                     },
                     "action": {
                         "type": "richmenuswitch",
-                        "richMenuAliasId": (
-                            "caregiver_patient1_report_issue"
-                        ),
-                        "data": (
-                            "switch-to-caregiver-patient1-report-issue"
-                        ),
+                        "richMenuAliasId": "caregiver_patient1_report_issue",
+                        "data": "switch-to-caregiver-patient1-report-issue",
                     },
                 },
                 {
