@@ -42,20 +42,6 @@ CHANNEL_SECRET = os.getenv("CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-FAMILY_RICH_MENU_ID = (
-    os.getenv("FAMILY_RICH_MENU_ID")
-    or get_home_rich_menu_id("family")
-)
-
-CAREGIVER_RICH_MENU_ID = (
-    os.getenv("CAREGIVER_RICH_MENU_ID")
-    or get_home_rich_menu_id("caregiver")
-)
-
-ELDERLY_RICH_MENU_ID = (
-    os.getenv("ELDERLY_RICH_MENU_ID")
-    or get_home_rich_menu_id("elderly")
-)
 
 required_env = {
     "CHANNEL_ACCESS_TOKEN": CHANNEL_ACCESS_TOKEN,
@@ -83,17 +69,39 @@ SQLITE_DB_PATH = os.path.join(DATA_DIR, "line_bot_users.db")
 ROLE_CONFIG = {
     "family": {
         "name": "家屬",
-        "rich_menu_id": FAMILY_RICH_MENU_ID,
+        "env_name": "FAMILY_RICH_MENU_ID",
     },
     "caregiver": {
         "name": "看護",
-        "rich_menu_id": CAREGIVER_RICH_MENU_ID,
+        "env_name": "CAREGIVER_RICH_MENU_ID",
     },
     "elderly": {
         "name": "長者",
-        "rich_menu_id": ELDERLY_RICH_MENU_ID,
+        "env_name": "ELDERLY_RICH_MENU_ID",
     },
 }
+
+
+def get_role_rich_menu_id(role):
+    """
+    每次需要綁定時即時取得 Rich Menu ID。
+
+    優先順序：
+    1. Render 環境變數
+    2. richmenu_ids.json
+    """
+    role_setting = ROLE_CONFIG.get(role)
+
+    if not role_setting:
+        return None
+
+    env_name = role_setting.get("env_name")
+    env_value = os.getenv(env_name) if env_name else None
+
+    if env_value:
+        return env_value.strip()
+
+    return get_home_rich_menu_id(role)
 
 
 # =========================================================
@@ -448,18 +456,25 @@ def get_line_profile(user_id):
 
 
 def link_rich_menu(user_id, rich_menu_id):
+    if not user_id:
+        raise RuntimeError("無法取得 LINE User ID")
+
     if not rich_menu_id:
-        return False
+        raise RuntimeError(
+            "找不到對應的 Rich Menu ID。"
+            "請確認 richmenu_ids.json 已建立，"
+            "或 Render 環境變數已設定。"
+        )
+
+    url = (
+        "https://api.line.me/v2/bot/user/"
+        f"{user_id}/richmenu/{rich_menu_id}"
+    )
 
     response = requests.post(
-        (
-            "https://api.line.me/v2/bot/user/"
-            f"{user_id}/richmenu/{rich_menu_id}"
-        ),
+        url,
         headers={
-            "Authorization": (
-                f"Bearer {CHANNEL_ACCESS_TOKEN}"
-            )
+            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
         },
         timeout=20,
     )
@@ -471,7 +486,25 @@ def link_rich_menu(user_id, rich_menu_id):
             f"{response.text}"
         )
 
+    app.logger.info(
+        "Rich Menu 綁定成功：user_id=%s, rich_menu_id=%s",
+        user_id,
+        rich_menu_id,
+    )
+
     return True
+
+
+def bind_role_rich_menu(user_id, role):
+    rich_menu_id = get_role_rich_menu_id(role)
+
+    if not rich_menu_id:
+        raise RuntimeError(
+            f"身份 {role} 尚未取得首頁 Rich Menu ID"
+        )
+
+    link_rich_menu(user_id, rich_menu_id)
+    return rich_menu_id
 
 
 # =========================================================
@@ -556,7 +589,8 @@ def handle_follow(event):
             reply_role_selection(event.reply_token)
             return
 
-        role_setting = ROLE_CONFIG.get(user["role"])
+        role = user["role"]
+        role_setting = ROLE_CONFIG.get(role)
 
         if not role_setting:
             reply_role_selection(event.reply_token)
@@ -565,13 +599,26 @@ def handle_follow(event):
         menu_linked = False
 
         try:
-            menu_linked = link_rich_menu(
+            rich_menu_id = bind_role_rich_menu(
                 user_id,
-                role_setting["rich_menu_id"],
+                role,
             )
-        except Exception:
+            menu_linked = True
+
+            if user.get("rich_menu_id") != rich_menu_id:
+                save_user(
+                    user_id=user_id,
+                    display_name=user.get("display_name") or "使用者",
+                    role=role,
+                    rich_menu_id=rich_menu_id,
+                    picture_url=user.get("picture_url"),
+                    language=user.get("language"),
+                )
+
+        except Exception as error:
             app.logger.error(
-                "重新綁定 Rich Menu 失敗"
+                "重新綁定 Rich Menu 失敗：%s",
+                error,
             )
             app.logger.error(traceback.format_exc())
 
@@ -607,12 +654,46 @@ def handle_text_message(event):
     user_id = get_user_id(event)
 
     try:
-        if user_id and not get_user(user_id):
+        user = get_user(user_id) if user_id else None
+
+        if user_id and not user:
             reply_role_selection(event.reply_token)
             return
 
+        user_text = (event.message.text or "").strip()
+
+        if user and user_text in {
+            "重新載入選單",
+            "重新綁定選單",
+            "載入選單",
+        }:
+            rich_menu_id = bind_role_rich_menu(
+                user_id,
+                user["role"],
+            )
+
+            save_user(
+                user_id=user_id,
+                display_name=user.get("display_name") or "使用者",
+                role=user["role"],
+                rich_menu_id=rich_menu_id,
+                picture_url=user.get("picture_url"),
+                language=user.get("language"),
+            )
+
+            role_name = ROLE_CONFIG.get(
+                user["role"],
+                {},
+            ).get("name", user["role"])
+
+            reply_text(
+                event.reply_token,
+                f"已重新載入「{role_name}」專用功能選單。",
+            )
+            return
+
         answer = gpt_response(
-            event.message.text
+            user_text
         )
 
         reply_text(
@@ -721,20 +802,51 @@ def handle_postback(event):
         existing_user = get_user(user_id)
 
         if existing_user:
+            existing_role = existing_user["role"]
             role_name = ROLE_CONFIG.get(
-                existing_user["role"],
+                existing_role,
                 {},
             ).get(
                 "name",
-                existing_user["role"],
+                existing_role,
             )
+
+            try:
+                rich_menu_id = bind_role_rich_menu(
+                    user_id,
+                    existing_role,
+                )
+
+                save_user(
+                    user_id=user_id,
+                    display_name=(
+                        existing_user.get("display_name")
+                        or "使用者"
+                    ),
+                    role=existing_role,
+                    rich_menu_id=rich_menu_id,
+                    picture_url=existing_user.get("picture_url"),
+                    language=existing_user.get("language"),
+                )
+
+                message = (
+                    "您的身份已經設定完成。\n"
+                    f"目前身份：{role_name}\n"
+                    "已重新載入專用功能選單。"
+                )
+
+            except Exception as error:
+                app.logger.error(traceback.format_exc())
+                message = (
+                    "您的身份已經設定完成。\n"
+                    f"目前身份：{role_name}\n"
+                    "但重新載入功能選單失敗："
+                    f"{error}"
+                )
 
             reply_text(
                 event.reply_token,
-                (
-                    "您的身份已經設定完成。\n"
-                    f"目前身份：{role_name}"
-                ),
+                message,
             )
             return
 
@@ -753,26 +865,33 @@ def handle_postback(event):
             or "使用者"
         )
 
+        rich_menu_id = get_role_rich_menu_id(role)
+
         # 先儲存身份，避免 Rich Menu 綁定失敗時資料遺失
         save_user(
             user_id=user_id,
             display_name=display_name,
             role=role,
-            rich_menu_id=role_setting["rich_menu_id"],
+            rich_menu_id=rich_menu_id,
             picture_url=profile.get("picture_url"),
             language=profile.get("language"),
         )
 
         menu_linked = False
+        menu_error = None
 
         try:
-            menu_linked = link_rich_menu(
+            bind_role_rich_menu(
                 user_id,
-                role_setting["rich_menu_id"],
+                role,
             )
-        except Exception:
+            menu_linked = True
+
+        except Exception as error:
+            menu_error = str(error)
             app.logger.error(
-                "Rich Menu 綁定失敗"
+                "Rich Menu 綁定失敗：%s",
+                error,
             )
             app.logger.error(traceback.format_exc())
 
@@ -780,8 +899,8 @@ def handle_postback(event):
             f"已載入「{role_setting['name']}」專用功能選單。"
             if menu_linked
             else (
-                "身份已成功儲存，"
-                "但目前尚未載入專用 Rich Menu。"
+                "身份已成功儲存，但功能選單載入失敗。\n"
+                f"原因：{menu_error or '未知錯誤'}"
             )
         )
 
