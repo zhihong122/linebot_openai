@@ -4,68 +4,7 @@ from richmenu_common import create_rich_menu_set
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(BASE_DIR, "static")
-
-
-def find_patient_image_dir():
-    target_image = "elder_main_menu.jpg"
-    matched_dirs = []
-
-    if not os.path.isdir(STATIC_DIR):
-        raise FileNotFoundError(
-            f"找不到 static 資料夾：{STATIC_DIR}"
-        )
-
-    for current_dir, _, filenames in os.walk(STATIC_DIR):
-        if target_image in filenames:
-            matched_dirs.append(current_dir)
-
-    if not matched_dirs:
-        raise FileNotFoundError(
-            "在 static 資料夾內找不到 "
-            f"{target_image}。\n"
-            "請確認長者圖片已提交到 GitHub，"
-            "並且 Render 已重新部署最新版本。"
-        )
-
-    if len(matched_dirs) > 1:
-        raise RuntimeError(
-            "找到多個長者圖片資料夾，無法判斷應使用哪一個：\n- "
-            + "\n- ".join(matched_dirs)
-        )
-
-    selected_dir = matched_dirs[0]
-
-    required_images = [
-        "elder_main_menu.jpg",
-        "elder_today_medication_menu.jpg",
-        "elder_my_medication_menu.jpg",
-        "elder_medication_report_menu.jpg",
-        "elder_discomfort_menu.jpg",
-        "elder_calendar_menu.jpg",
-        "elder_sos_menu.jpg",
-    ]
-
-    missing_images = [
-        filename
-        for filename in required_images
-        if not os.path.isfile(
-            os.path.join(selected_dir, filename)
-        )
-    ]
-
-    if missing_images:
-        raise FileNotFoundError(
-            f"長者圖片資料夾：{selected_dir}\n"
-            "但缺少以下圖片：\n- "
-            + "\n- ".join(missing_images)
-        )
-
-    print(f"[elderly] 使用圖片資料夾：{selected_dir}")
-    return selected_dir
-
-
-IMAGE_DIR = find_patient_image_dir()
+IMAGE_DIR = os.path.join(BASE_DIR, "static", "paitent")
 
 
 MENU_DEFINITIONS = {
