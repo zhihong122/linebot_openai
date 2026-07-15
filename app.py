@@ -634,6 +634,7 @@ def handle_follow(event):
                 f"{user.get('display_name') or '使用者'}，"
                 "歡迎回來！\n"
                 f"目前身份：{role_setting['name']}\n"
+                f"LINE User ID：{user_id}\n"
                 f"{menu_text}"
             ),
         )
@@ -688,7 +689,10 @@ def handle_text_message(event):
 
             reply_text(
                 event.reply_token,
-                f"已重新載入「{role_name}」專用功能選單。",
+                (
+                    f"已重新載入「{role_name}」專用功能選單。\n"
+                    f"LINE User ID：{user_id}"
+                ),
             )
             return
 
@@ -832,6 +836,7 @@ def handle_postback(event):
                 message = (
                     "您的身份已經設定完成。\n"
                     f"目前身份：{role_name}\n"
+                    f"LINE User ID：{user_id}\n"
                     "已重新載入專用功能選單。"
                 )
 
@@ -840,6 +845,7 @@ def handle_postback(event):
                 message = (
                     "您的身份已經設定完成。\n"
                     f"目前身份：{role_name}\n"
+                    f"LINE User ID：{user_id}\n"
                     "但重新載入功能選單失敗："
                     f"{error}"
                 )
@@ -909,7 +915,8 @@ def handle_postback(event):
             (
                 "身份設定完成！\n\n"
                 f"名稱：{display_name}\n"
-                f"身份：{role_setting['name']}\n\n"
+                f"身份：{role_setting['name']}\n"
+                f"LINE User ID：{user_id}\n\n"
                 f"{menu_status}"
             ),
         )
