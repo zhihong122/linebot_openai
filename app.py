@@ -1,6 +1,6 @@
 from flask import Flask, request, abort
 import os
-import sqlite3
+import json
 import traceback
 from urllib.parse import parse_qs
 
@@ -62,9 +62,7 @@ if missing_env:
 # =========================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
 TMP_DIR = os.path.join(BASE_DIR, "static", "tmp")
-SQLITE_DB_PATH = os.path.join(DATA_DIR, "line_bot_users.db")
 
 ROLE_CONFIG = {
     "family": {
@@ -80,28 +78,6 @@ ROLE_CONFIG = {
         "env_name": "ELDERLY_RICH_MENU_ID",
     },
 }
-
-
-def get_role_rich_menu_id(role):
-    """
-    每次需要綁定時即時取得 Rich Menu ID。
-
-    優先順序：
-    1. Render 環境變數
-    2. richmenu_ids.json
-    """
-    role_setting = ROLE_CONFIG.get(role)
-
-    if not role_setting:
-        return None
-
-    env_name = role_setting.get("env_name")
-    env_value = os.getenv(env_name) if env_name else None
-
-    if env_value:
-        return env_value.strip()
-
-    return get_home_rich_menu_id(role)
 
 
 # =========================================================
@@ -161,70 +137,467 @@ def reply_text(reply_token, text):
 
 
 # =========================================================
-# 資料庫
+# PostgreSQL 資料庫
 # =========================================================
 
-def using_postgresql():
-    return bool(DATABASE_URL)
-
-
 def get_db_connection():
-    if using_postgresql():
-        try:
-            import psycopg2
-        except ImportError as error:
-            raise RuntimeError(
-                "使用 PostgreSQL 時需安裝 psycopg2-binary"
-            ) from error
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "缺少 DATABASE_URL，無法連線 PostgreSQL"
+        )
 
-        return psycopg2.connect(DATABASE_URL)
+    try:
+        import psycopg2
+    except ImportError as error:
+        raise RuntimeError(
+            "使用 PostgreSQL 時需安裝 psycopg2-binary"
+        ) from error
 
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-    connection = sqlite3.connect(
-        SQLITE_DB_PATH,
-        timeout=30,
-    )
-    connection.row_factory = sqlite3.Row
-    return connection
+    return psycopg2.connect(DATABASE_URL)
 
 
 def init_database():
+    """
+    驗證新版 PostgreSQL 架構是否已建立。
+    不再建立舊的 line_users 資料表。
+    """
+    required_tables = {
+        "roles",
+        "languages",
+        "app_users",
+        "rich_menus",
+        "user_rich_menu_bindings",
+        "operation_logs",
+    }
+
+    connection = get_db_connection()
+
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+            """
+        )
+
+        existing_tables = {
+            row[0]
+            for row in cursor.fetchall()
+        }
+
+        missing_tables = sorted(
+            required_tables - existing_tables
+        )
+
+        if missing_tables:
+            raise RuntimeError(
+                "新版 PostgreSQL 架構尚未完成，缺少資料表："
+                + ", ".join(missing_tables)
+            )
+
+    finally:
+        connection.close()
+
+
+def get_default_language_code(role, profile_language=None):
+    """
+    優先使用 LINE Profile 回傳語言。
+    若資料庫未支援該語言，save_user() 會回退到身份預設語言。
+    """
+    if profile_language:
+        return profile_language
+
+    if role == "caregiver":
+        return "en"
+
+    return "zh-TW"
+
+
+def get_user(user_id):
+    if not user_id:
+        return None
+
+    connection = get_db_connection()
+
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                u.id,
+                u.line_user_id AS user_id,
+                u.display_name,
+                r.code AS role,
+                u.current_rich_menu_id AS rich_menu_id,
+                u.picture_url,
+                l.code AS language,
+                u.created_at,
+                u.updated_at,
+                u.last_seen_at
+            FROM app_users u
+            JOIN roles r
+                ON r.id = u.role_id
+            LEFT JOIN languages l
+                ON l.id = u.language_id
+            WHERE u.line_user_id = %s
+              AND u.is_active = TRUE
+            """,
+            (user_id,),
+        )
+
+        row = cursor.fetchone()
+
+        if not row:
+            return None
+
+        columns = [
+            column[0]
+            for column in cursor.description
+        ]
+        return dict(zip(columns, row))
+
+    finally:
+        connection.close()
+
+
+def get_role_rich_menu_id_from_database(role):
+    """
+    從 rich_menus 取得該身份啟用中的首頁 Rich Menu。
+    caregiver 預設使用英文；其他身份預設繁體中文。
+    """
+    language_code = (
+        "en"
+        if role == "caregiver"
+        else "zh-TW"
+    )
+
+    connection = get_db_connection()
+
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT rm.line_rich_menu_id
+            FROM rich_menus rm
+            JOIN roles r
+                ON r.id = rm.role_id
+            JOIN languages l
+                ON l.id = rm.language_id
+            WHERE r.code = %s
+              AND l.code = %s
+              AND rm.is_home = TRUE
+              AND rm.is_active = TRUE
+              AND rm.line_rich_menu_id IS NOT NULL
+            ORDER BY rm.updated_at DESC
+            LIMIT 1
+            """,
+            (role, language_code),
+        )
+
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    finally:
+        connection.close()
+
+
+def get_role_rich_menu_id(role):
+    """
+    取得身份對應首頁 Rich Menu ID。
+
+    優先順序：
+    1. PostgreSQL rich_menus
+    2. Render 環境變數
+    3. richmenu_ids.json
+    """
+    database_value = get_role_rich_menu_id_from_database(
+        role
+    )
+
+    if database_value:
+        return database_value
+
+    role_setting = ROLE_CONFIG.get(role)
+
+    if not role_setting:
+        return None
+
+    env_name = role_setting.get("env_name")
+    env_value = os.getenv(env_name) if env_name else None
+
+    if env_value:
+        return env_value.strip()
+
+    return get_home_rich_menu_id(role)
+
+
+def save_user(
+    user_id,
+    display_name,
+    role,
+    rich_menu_id=None,
+    picture_url=None,
+    language=None,
+):
+    """
+    儲存或更新 LINE 使用者、身份、語言及目前 Rich Menu。
+    """
     connection = get_db_connection()
 
     try:
         cursor = connection.cursor()
 
-        if using_postgresql():
+        cursor.execute(
+            """
+            SELECT id
+            FROM roles
+            WHERE code = %s
+              AND is_active = TRUE
+            """,
+            (role,),
+        )
+        role_row = cursor.fetchone()
+
+        if not role_row:
+            raise RuntimeError(
+                f"資料庫找不到身份代碼：{role}"
+            )
+
+        role_id = role_row[0]
+        requested_language = get_default_language_code(
+            role,
+            language,
+        )
+
+        cursor.execute(
+            """
+            SELECT id
+            FROM languages
+            WHERE code = %s
+              AND is_active = TRUE
+            """,
+            (requested_language,),
+        )
+        language_row = cursor.fetchone()
+
+        if not language_row:
+            fallback_language = (
+                "en"
+                if role == "caregiver"
+                else "zh-TW"
+            )
+
             cursor.execute(
                 """
-                CREATE TABLE IF NOT EXISTS line_users (
-                    user_id VARCHAR(100) PRIMARY KEY,
-                    display_name VARCHAR(255),
-                    role VARCHAR(50) NOT NULL,
-                    rich_menu_id VARCHAR(255),
-                    picture_url TEXT,
-                    language VARCHAR(30),
-                    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-                )
-                """
+                SELECT id
+                FROM languages
+                WHERE code = %s
+                  AND is_active = TRUE
+                """,
+                (fallback_language,),
             )
-        else:
+            language_row = cursor.fetchone()
+
+        language_id = (
+            language_row[0]
+            if language_row
+            else None
+        )
+
+        cursor.execute(
+            """
+            INSERT INTO app_users (
+                line_user_id,
+                display_name,
+                picture_url,
+                role_id,
+                language_id,
+                current_rich_menu_id,
+                is_active,
+                last_seen_at
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, TRUE,
+                CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (line_user_id)
+            DO UPDATE SET
+                display_name = EXCLUDED.display_name,
+                picture_url = EXCLUDED.picture_url,
+                role_id = EXCLUDED.role_id,
+                language_id = EXCLUDED.language_id,
+                current_rich_menu_id =
+                    EXCLUDED.current_rich_menu_id,
+                is_active = TRUE,
+                last_seen_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING id
+            """,
+            (
+                user_id,
+                display_name,
+                picture_url,
+                role_id,
+                language_id,
+                rich_menu_id,
+            ),
+        )
+
+        app_user_id = cursor.fetchone()[0]
+        connection.commit()
+        return app_user_id
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
+
+
+def record_rich_menu_binding(
+    line_user_id,
+    role,
+    line_rich_menu_id,
+    success=True,
+    error_message=None,
+):
+    """
+    記錄使用者目前綁定的 Rich Menu。
+    成功時會將前一筆 is_current 改為 FALSE。
+    """
+    connection = get_db_connection()
+
+    try:
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT id
+            FROM app_users
+            WHERE line_user_id = %s
+            """,
+            (line_user_id,),
+        )
+        user_row = cursor.fetchone()
+
+        if not user_row:
+            raise RuntimeError(
+                "記錄 Rich Menu 綁定時找不到使用者"
+            )
+
+        app_user_id = user_row[0]
+
+        cursor.execute(
+            """
+            SELECT rm.id
+            FROM rich_menus rm
+            JOIN roles r
+                ON r.id = rm.role_id
+            WHERE r.code = %s
+              AND rm.line_rich_menu_id = %s
+              AND rm.is_active = TRUE
+            LIMIT 1
+            """,
+            (role, line_rich_menu_id),
+        )
+        menu_row = cursor.fetchone()
+
+        if success and menu_row:
+            rich_menu_uuid = menu_row[0]
+
             cursor.execute(
                 """
-                CREATE TABLE IF NOT EXISTS line_users (
-                    user_id TEXT PRIMARY KEY,
-                    display_name TEXT,
-                    role TEXT NOT NULL,
-                    rich_menu_id TEXT,
-                    picture_url TEXT,
-                    language TEXT,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-                """
+                UPDATE user_rich_menu_bindings
+                SET
+                    is_current = FALSE,
+                    unbound_at = CURRENT_TIMESTAMP
+                WHERE user_id = %s
+                  AND is_current = TRUE
+                """,
+                (app_user_id,),
             )
+
+            cursor.execute(
+                """
+                INSERT INTO user_rich_menu_bindings (
+                    user_id,
+                    rich_menu_id,
+                    line_rich_menu_id,
+                    is_current,
+                    error_message
+                )
+                VALUES (%s, %s, %s, TRUE, NULL)
+                """,
+                (
+                    app_user_id,
+                    rich_menu_uuid,
+                    line_rich_menu_id,
+                ),
+            )
+
+            cursor.execute(
+                """
+                UPDATE app_users
+                SET
+                    current_rich_menu_id = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """,
+                (
+                    line_rich_menu_id,
+                    app_user_id,
+                ),
+            )
+
+        cursor.execute(
+            """
+            INSERT INTO operation_logs (
+                user_id,
+                action_type,
+                entity_type,
+                entity_id,
+                details,
+                success,
+                error_message
+            )
+            VALUES (
+                %s,
+                %s,
+                'rich_menu',
+                %s,
+                %s::jsonb,
+                %s,
+                %s
+            )
+            """,
+            (
+                app_user_id,
+                (
+                    "rich_menu_bound"
+                    if success
+                    else "rich_menu_bind_failed"
+                ),
+                (
+                    menu_row[0]
+                    if menu_row
+                    else None
+                ),
+                json.dumps(
+                    {
+                        "role": role,
+                        "line_rich_menu_id": (
+                            line_rich_menu_id
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
+                success,
+                error_message,
+            ),
+        )
 
         connection.commit()
 
@@ -236,126 +609,52 @@ def init_database():
         connection.close()
 
 
-def get_user(user_id):
-    if not user_id:
-        return None
-
-    connection = get_db_connection()
-
-    try:
-        cursor = connection.cursor()
-        placeholder = "%s" if using_postgresql() else "?"
-
-        cursor.execute(
-            f"""
-            SELECT
-                user_id,
-                display_name,
-                role,
-                rich_menu_id,
-                picture_url,
-                language,
-                created_at,
-                updated_at
-            FROM line_users
-            WHERE user_id = {placeholder}
-            """,
-            (user_id,),
-        )
-
-        row = cursor.fetchone()
-
-        if not row:
-            return None
-
-        if using_postgresql():
-            columns = [
-                column[0]
-                for column in cursor.description
-            ]
-            return dict(zip(columns, row))
-
-        return dict(row)
-
-    finally:
-        connection.close()
-
-
-def save_user(
-    user_id,
-    display_name,
+def record_role_selection(
+    line_user_id,
     role,
-    rich_menu_id=None,
-    picture_url=None,
-    language=None,
 ):
     connection = get_db_connection()
 
     try:
         cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT id
+            FROM app_users
+            WHERE line_user_id = %s
+            """,
+            (line_user_id,),
+        )
+        row = cursor.fetchone()
 
-        if using_postgresql():
-            cursor.execute(
-                """
-                INSERT INTO line_users (
-                    user_id,
-                    display_name,
-                    role,
-                    rich_menu_id,
-                    picture_url,
-                    language
-                )
-                VALUES (%s, %s, %s, %s, %s, %s)
+        if not row:
+            return
 
-                ON CONFLICT (user_id)
-                DO UPDATE SET
-                    display_name = EXCLUDED.display_name,
-                    role = EXCLUDED.role,
-                    rich_menu_id = EXCLUDED.rich_menu_id,
-                    picture_url = EXCLUDED.picture_url,
-                    language = EXCLUDED.language,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    user_id,
-                    display_name,
-                    role,
-                    rich_menu_id,
-                    picture_url,
-                    language,
-                ),
+        cursor.execute(
+            """
+            INSERT INTO operation_logs (
+                user_id,
+                action_type,
+                entity_type,
+                details,
+                success
             )
-        else:
-            cursor.execute(
-                """
-                INSERT INTO line_users (
-                    user_id,
-                    display_name,
-                    role,
-                    rich_menu_id,
-                    picture_url,
-                    language
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-
-                ON CONFLICT(user_id)
-                DO UPDATE SET
-                    display_name = excluded.display_name,
-                    role = excluded.role,
-                    rich_menu_id = excluded.rich_menu_id,
-                    picture_url = excluded.picture_url,
-                    language = excluded.language,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    user_id,
-                    display_name,
-                    role,
-                    rich_menu_id,
-                    picture_url,
-                    language,
-                ),
+            VALUES (
+                %s,
+                'role_selected',
+                'role',
+                %s::jsonb,
+                TRUE
             )
+            """,
+            (
+                row[0],
+                json.dumps(
+                    {"role": role},
+                    ensure_ascii=False,
+                ),
+            ),
+        )
 
         connection.commit()
 
@@ -503,8 +802,34 @@ def bind_role_rich_menu(user_id, role):
             f"身份 {role} 尚未取得首頁 Rich Menu ID"
         )
 
-    link_rich_menu(user_id, rich_menu_id)
-    return rich_menu_id
+    try:
+        link_rich_menu(user_id, rich_menu_id)
+
+        record_rich_menu_binding(
+            line_user_id=user_id,
+            role=role,
+            line_rich_menu_id=rich_menu_id,
+            success=True,
+        )
+
+        return rich_menu_id
+
+    except Exception as error:
+        try:
+            record_rich_menu_binding(
+                line_user_id=user_id,
+                role=role,
+                line_rich_menu_id=rich_menu_id,
+                success=False,
+                error_message=str(error),
+            )
+        except Exception:
+            app.logger.error(
+                "記錄 Rich Menu 綁定失敗時發生錯誤"
+            )
+            app.logger.error(traceback.format_exc())
+
+        raise
 
 
 # =========================================================
@@ -538,15 +863,9 @@ def gpt_response(user_text):
 
 @app.route("/", methods=["GET"])
 def home():
-    database_name = (
-        "PostgreSQL"
-        if using_postgresql()
-        else "SQLite"
-    )
-
     return (
         "LINE Bot is running. "
-        f"Database: {database_name}"
+        "Database: PostgreSQL"
     )
 
 
@@ -881,6 +1200,11 @@ def handle_postback(event):
             rich_menu_id=rich_menu_id,
             picture_url=profile.get("picture_url"),
             language=profile.get("language"),
+        )
+
+        record_role_selection(
+            line_user_id=user_id,
+            role=role,
         )
 
         menu_linked = False
