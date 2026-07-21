@@ -16,7 +16,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "查看更多資訊",
             "areas": [
                 {
-                    "bounds": {"x": 0, "y": 0, "width": 833, "height": 843},
+                    "bounds": {"x": 35, "y": 251, "width": 798, "height": 665},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_today_medication",
@@ -24,7 +24,7 @@ MENU_DEFINITIONS = {
                     },
                 },
                 {
-                    "bounds": {"x": 834, "y": 0, "width": 833, "height": 843},
+                    "bounds": {"x": 855, "y": 251, "width": 827, "height": 671},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_my_medication",
@@ -32,7 +32,7 @@ MENU_DEFINITIONS = {
                     },
                 },
                 {
-                    "bounds": {"x": 1663, "y": 0, "width": 837, "height": 843},
+                    "bounds": {"x": 1701, "y": 254, "width": 772, "height": 665},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_medication_report",
@@ -40,7 +40,7 @@ MENU_DEFINITIONS = {
                     },
                 },
                 {
-                    "bounds": {"x": 0, "y": 843, "width": 833, "height": 843},
+                    "bounds": {"x": 38, "y": 935, "width": 792, "height": 740},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_discomfort",
@@ -48,7 +48,7 @@ MENU_DEFINITIONS = {
                     },
                 },
                 {
-                    "bounds": {"x": 834, "y": 843, "width": 833, "height": 843},
+                    "bounds": {"x": 852, "y": 941, "width": 826, "height": 741},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_calendar",
@@ -56,7 +56,7 @@ MENU_DEFINITIONS = {
                     },
                 },
                 {
-                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
+                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_sos",
@@ -76,7 +76,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
+                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_main",
@@ -96,7 +96,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
+                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_main",
@@ -116,7 +116,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
+                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_main",
@@ -136,7 +136,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
+                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_main",
@@ -156,7 +156,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
+                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_main",
@@ -176,7 +176,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
+                    "bounds": {"x": 1259, "y": 938, "width": 1208, "height": 734},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_main",
