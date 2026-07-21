@@ -76,7 +76,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
+                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "family_main",
@@ -96,7 +96,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
+                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "family_main",
@@ -116,7 +116,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
+                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "family_main",
@@ -136,7 +136,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
+                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "family_main",
@@ -156,7 +156,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
+                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "family_main",
@@ -176,7 +176,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
+                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "family_main",
