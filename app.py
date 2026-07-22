@@ -25,6 +25,7 @@ from linebot.v3.messaging import (
     QuickReply,
     QuickReplyItem,
     PostbackAction,
+    DatetimePickerAction,
 )
 from linebot.v3.webhooks import (
     MessageEvent,
@@ -870,6 +871,18 @@ FAMILY_ACTIONS = {
     "family_medication_select_item",
     "family_medication_select_bag",
     "family_medication_confirm_quantity",
+    "family_calendar_view",
+    "family_calendar_add",
+    "family_calendar_edit",
+    "family_calendar_delete",
+    "family_calendar_reminder",
+    "family_calendar_select_patient",
+    "family_calendar_select_event",
+    "family_calendar_select_edit_field",
+    "family_calendar_save_datetime",
+    "family_calendar_confirm_delete",
+    "family_calendar_enable_reminder",
+    "family_calendar_disable_reminder",
     "family_cancel",
 }
 
@@ -899,6 +912,18 @@ def postback_item(label, data, display_text=None):
             display_text=(display_text or label)[:300],
         )
     )
+
+
+
+def datetime_item(label, data, mode="datetime", initial=None, minimum=None, maximum=None):
+    kwargs = {"label": label[:20], "data": data, "mode": mode}
+    if initial:
+        kwargs["initial"] = initial
+    if minimum:
+        kwargs["min"] = minimum
+    if maximum:
+        kwargs["max"] = maximum
+    return QuickReplyItem(action=DatetimePickerAction(**kwargs))
 
 
 def get_app_user_by_line_id(line_user_id):
@@ -1175,10 +1200,54 @@ def handle_family_text_input(event, user_text, user_id):
             ),
         )
         return True
+
+    if state["step"] == "waiting_calendar_title":
+        payload = state.get("payload", {})
+        payload["calendar_title"] = user_text[:255]
+        set_operation_state(user_id,"family_calendar_add","waiting_calendar_location",payload)
+        reply_text(event.reply_token,
+            "請輸入醫院或地點，例如：埔里基督教醫院\n若沒有地點請輸入「未填寫」。")
+        return True
+
+    if state["step"] == "waiting_calendar_location":
+        payload = state.get("payload", {})
+        payload["calendar_location"] = None if user_text in {"未填寫","無","沒有"} else user_text[:500]
+        set_operation_state(user_id,"family_calendar_add","calendar_waiting_datetime",payload)
+        reply_message(event.reply_token,make_quick_reply_message(
+            "請點選預計前往醫院的日期與時間：",
+            [
+                datetime_item("選擇日期時間",
+                    "action=family_calendar_save_datetime&mode=add",
+                    mode="datetime",
+                    minimum=datetime.now().strftime("%Y-%m-%dT%H:%M")),
+                postback_item("取消","action=family_cancel"),
+            ]))
+        return True
+
+    if state["step"] == "waiting_calendar_edit_title":
+        payload = state.get("payload", {})
+        update_patient_calendar_event(
+            payload["event_id"],payload["patient_id"],"title",user_text[:255])
+        clear_operation_state(user_id)
+        reply_text(event.reply_token,f"行程名稱已修改為：{user_text[:255]}")
+        return True
+
+    if state["step"] == "waiting_calendar_edit_location":
+        payload = state.get("payload", {})
+        new_location = None if user_text in {"未填寫","無","沒有"} else user_text[:500]
+        update_patient_calendar_event(
+            payload["event_id"],payload["patient_id"],"location",new_location)
+        clear_operation_state(user_id)
+        reply_text(event.reply_token,f"行程地點已修改為：{new_location or '未填寫'}")
+        return True
+
     return False
 
 
 def handle_family_postback(event, action, params):
+    if action.startswith("family_calendar_"):
+        return handle_family_calendar_postback(event, action, params)
+
     if action.startswith("family_medication_"):
         return handle_family_medication_postback(event, action, params)
 
@@ -1922,6 +1991,425 @@ def handle_family_medication_postback(event, action, params):
         )
         return True
 
+    return False
+
+
+# =========================================================
+# 家屬行事曆管理
+# =========================================================
+
+CALENDAR_ACTION_LABELS = {
+    "family_calendar_view": "查看行事曆",
+    "family_calendar_add": "新增行程",
+    "family_calendar_edit": "修改行程",
+    "family_calendar_delete": "刪除行程",
+    "family_calendar_reminder": "回診提醒",
+}
+
+
+def list_patient_calendar_events(patient_id, upcoming_only=True, limit=30):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT id,title,description,location,starts_at,ends_at,
+                   all_day,event_type,COALESCE(is_active,TRUE)
+            FROM calendar_events
+            WHERE patient_id=%s
+              AND COALESCE(is_active,TRUE)=TRUE
+              AND (%s=FALSE OR starts_at >= CURRENT_TIMESTAMP - INTERVAL '1 day')
+            ORDER BY starts_at ASC
+            LIMIT %s
+            """,
+            (patient_id, upcoming_only, limit),
+        )
+        return [{
+            "id": r[0], "title": r[1], "description": r[2],
+            "location": r[3], "starts_at": r[4], "ends_at": r[5],
+            "all_day": r[6], "event_type": r[7], "is_active": r[8],
+        } for r in cursor.fetchall()]
+    finally:
+        connection.close()
+
+
+def get_patient_calendar_event(patient_id, event_id):
+    for item in list_patient_calendar_events(patient_id, upcoming_only=False, limit=100):
+        if str(item["id"]) == str(event_id):
+            return item
+    return None
+
+
+def create_patient_calendar_event(patient_id,title,description,location,starts_at,created_by,event_type="hospital_visit"):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO calendar_events (
+                patient_id,title,description,location,starts_at,ends_at,
+                all_day,event_type,created_by,source_type,is_active
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,FALSE,%s,%s,'manual',TRUE)
+            RETURNING id
+            """,
+            (patient_id,title,description,location,starts_at,
+             starts_at + timedelta(hours=1),event_type,created_by),
+        )
+        event_id = cursor.fetchone()[0]
+        connection.commit()
+        return event_id
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def update_patient_calendar_event(event_id,patient_id,field,value):
+    allowed = {"title":"title","location":"location","starts_at":"starts_at"}
+    column = allowed.get(field)
+    if not column:
+        raise RuntimeError("不支援的行事曆修改欄位")
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        if field == "starts_at":
+            cursor.execute(
+                """
+                UPDATE calendar_events
+                SET starts_at=%s, ends_at=%s + INTERVAL '1 hour',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=%s AND patient_id=%s AND COALESCE(is_active,TRUE)=TRUE
+                """,
+                (value,value,event_id,patient_id),
+            )
+        else:
+            cursor.execute(
+                f"""
+                UPDATE calendar_events
+                SET {column}=%s, updated_at=CURRENT_TIMESTAMP
+                WHERE id=%s AND patient_id=%s AND COALESCE(is_active,TRUE)=TRUE
+                """,
+                (value,event_id,patient_id),
+            )
+        if cursor.rowcount == 0:
+            raise RuntimeError("找不到要修改的行程")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def delete_patient_calendar_event(event_id,patient_id):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE calendar_events
+            SET is_active=FALSE, updated_at=CURRENT_TIMESTAMP
+            WHERE id=%s AND patient_id=%s AND COALESCE(is_active,TRUE)=TRUE
+            """,
+            (event_id,patient_id),
+        )
+        if cursor.rowcount == 0:
+            raise RuntimeError("找不到要刪除的行程")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def get_followup_reminder_setting(patient_id,family_user_id):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT is_enabled,days_before,reminder_time
+            FROM followup_reminder_settings
+            WHERE patient_id=%s AND family_user_id=%s
+            """,
+            (patient_id,family_user_id),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {"is_enabled":False,"days_before":3,"reminder_time":"09:00"}
+        return {"is_enabled":row[0],"days_before":row[1],"reminder_time":str(row[2])[:5]}
+    finally:
+        connection.close()
+
+
+def save_followup_reminder_setting(patient_id,family_user_id,is_enabled,days_before=3,reminder_time="09:00"):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO followup_reminder_settings (
+                patient_id,family_user_id,is_enabled,days_before,reminder_time,updated_at
+            )
+            VALUES (%s,%s,%s,%s,%s,CURRENT_TIMESTAMP)
+            ON CONFLICT (patient_id,family_user_id)
+            DO UPDATE SET is_enabled=EXCLUDED.is_enabled,
+                          days_before=EXCLUDED.days_before,
+                          reminder_time=EXCLUDED.reminder_time,
+                          updated_at=CURRENT_TIMESTAMP
+            """,
+            (patient_id,family_user_id,is_enabled,days_before,reminder_time),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def calendar_event_text(patient,events):
+    if not events:
+        return f"{patient['display_name']}目前沒有行事曆行程。"
+    lines = [f"{patient['display_name']}的行事曆："]
+    for index,item in enumerate(events,1):
+        event_name = "原訂回診" if item.get("event_type") == "follow_up" else "自行新增"
+        lines.extend([
+            "",
+            f"{index}. {item['title']}",
+            f"時間：{item['starts_at'].strftime('%Y-%m-%d %H:%M')}",
+            f"類型：{event_name}",
+            f"地點：{item.get('location') or '未填寫'}",
+        ])
+        if item.get("description"):
+            lines.append(f"備註：{item['description']}")
+    return "\n".join(lines)
+
+
+def send_calendar_patient_selection(event,user_id,action,family_id):
+    patients = list_family_patients(family_id)
+    if not patients:
+        reply_text(event.reply_token,"目前家庭尚未新增長者，請先到「家庭管理」新增長者。")
+        return True
+    if len(patients) == 1:
+        return handle_calendar_selected_patient(event,user_id,action,patients[0])
+    set_operation_state(user_id,action,"calendar_select_patient",{})
+    items = [
+        postback_item(
+            p["display_name"],
+            f"action=family_calendar_select_patient&next_action={action}&patient_id={p['patient_id']}",
+            f"選擇 {p['display_name']}",
+        )
+        for p in patients[:12]
+    ]
+    reply_message(event.reply_token,make_quick_reply_message(
+        f"{CALENDAR_ACTION_LABELS.get(action,'行事曆')}\n請選擇長者：",items))
+    return True
+
+
+def handle_calendar_selected_patient(event,user_id,action,patient):
+    patient_id = patient["patient_id"]
+    payload = {"patient_id":str(patient_id),"patient_name":patient["display_name"]}
+
+    if action == "family_calendar_view":
+        clear_operation_state(user_id)
+        reply_text(event.reply_token,calendar_event_text(
+            patient,list_patient_calendar_events(patient_id,upcoming_only=False)))
+        return True
+
+    if action == "family_calendar_add":
+        set_operation_state(user_id,action,"waiting_calendar_title",payload)
+        reply_text(event.reply_token,
+            f"長者：{patient['display_name']}\n請輸入行程名稱，例如：\n用藥後不舒服回診\n\n輸入「取消」可結束。")
+        return True
+
+    if action in {"family_calendar_edit","family_calendar_delete"}:
+        events = list_patient_calendar_events(patient_id,upcoming_only=False)
+        if not events:
+            clear_operation_state(user_id)
+            reply_text(event.reply_token,f"{patient['display_name']}目前沒有可操作的行程。")
+            return True
+        payload["calendar_action"] = action
+        set_operation_state(user_id,action,"calendar_select_event",payload)
+        items = [
+            postback_item(
+                f"{item['starts_at'].strftime('%m/%d')} {item['title']}"[:20],
+                f"action=family_calendar_select_event&calendar_action={action}&event_id={item['id']}",
+            )
+            for item in events[:12]
+        ]
+        verb = "修改" if action == "family_calendar_edit" else "刪除"
+        reply_message(event.reply_token,make_quick_reply_message(
+            f"長者：{patient['display_name']}\n請選擇要{verb}的行程：",items))
+        return True
+
+    if action == "family_calendar_reminder":
+        family = ensure_family_admin(user_id)
+        setting = get_followup_reminder_setting(patient_id,family["admin_user_id"])
+        payload["is_enabled"] = setting["is_enabled"]
+        set_operation_state(user_id,action,"calendar_reminder_setting",payload)
+        status = "已開啟" if setting["is_enabled"] else "未開啟"
+        reply_message(event.reply_token,make_quick_reply_message(
+            f"長者：{patient['display_name']}\n回診提醒目前：{status}\n"
+            f"預設於回診前 {setting['days_before']} 天 {setting['reminder_time']} 提醒。",
+            [
+                postback_item("開啟提醒","action=family_calendar_enable_reminder"),
+                postback_item("關閉提醒","action=family_calendar_disable_reminder"),
+                postback_item("取消","action=family_cancel"),
+            ]))
+        return True
+    return False
+
+
+def handle_family_calendar_postback(event,action,params):
+    user_id = get_user_id(event)
+    if not user_id:
+        reply_text(event.reply_token,"無法取得您的 LINE User ID。")
+        return True
+    family = ensure_family_admin(user_id)
+    family_id = family["id"]
+    admin_id = family["admin_user_id"]
+
+    if action in CALENDAR_ACTION_LABELS:
+        return send_calendar_patient_selection(event,user_id,action,family_id)
+
+    if action == "family_calendar_select_patient":
+        next_action = params.get("next_action",[None])[0]
+        patient_id = params.get("patient_id",[None])[0]
+        patient = get_family_patient(family_id,patient_id)
+        if not patient:
+            raise RuntimeError("找不到這位長者，或長者已不在此家庭")
+        if next_action not in CALENDAR_ACTION_LABELS:
+            raise RuntimeError("行事曆功能資料已逾時")
+        return handle_calendar_selected_patient(event,user_id,next_action,patient)
+
+    if action == "family_calendar_select_event":
+        state = get_operation_state(user_id)
+        payload = state.get("payload",{}) if state else {}
+        patient_id = payload.get("patient_id")
+        calendar_action = params.get("calendar_action",[None])[0]
+        event_id = params.get("event_id",[None])[0]
+        patient = get_family_patient(family_id,patient_id)
+        item = get_patient_calendar_event(patient_id,event_id) if patient else None
+        if not patient or not item:
+            raise RuntimeError("行程資料已逾時，請重新操作")
+        payload.update({"event_id":str(item["id"]),"event_title":item["title"]})
+
+        if calendar_action == "family_calendar_delete":
+            set_operation_state(user_id,calendar_action,"calendar_confirm_delete",payload)
+            reply_message(event.reply_token,make_quick_reply_message(
+                f"確定刪除以下行程？\n\n長者：{patient['display_name']}\n"
+                f"行程：{item['title']}\n時間：{item['starts_at'].strftime('%Y-%m-%d %H:%M')}",
+                [
+                    postback_item("確認刪除","action=family_calendar_confirm_delete"),
+                    postback_item("取消","action=family_cancel"),
+                ]))
+            return True
+
+        set_operation_state(user_id,"family_calendar_edit","calendar_select_edit_field",payload)
+        reply_message(event.reply_token,make_quick_reply_message(
+            f"行程：{item['title']}\n請選擇要修改的內容：",
+            [
+                postback_item("修改名稱","action=family_calendar_select_edit_field&field=title"),
+                postback_item("修改日期時間","action=family_calendar_select_edit_field&field=starts_at"),
+                postback_item("修改地點","action=family_calendar_select_edit_field&field=location"),
+                postback_item("取消","action=family_cancel"),
+            ]))
+        return True
+
+    if action == "family_calendar_select_edit_field":
+        state = get_operation_state(user_id)
+        payload = state.get("payload",{}) if state else {}
+        field = params.get("field",[None])[0]
+        if not payload.get("event_id"):
+            raise RuntimeError("修改資料已逾時，請重新操作")
+        if field == "starts_at":
+            payload["edit_field"] = field
+            set_operation_state(user_id,"family_calendar_edit","calendar_waiting_datetime",payload)
+            reply_message(event.reply_token,make_quick_reply_message(
+                "請點選新的日期與時間：",
+                [
+                    datetime_item("選擇日期時間",
+                        "action=family_calendar_save_datetime&mode=edit",
+                        mode="datetime",
+                        minimum=datetime.now().strftime("%Y-%m-%dT%H:%M")),
+                    postback_item("取消","action=family_cancel"),
+                ]))
+            return True
+        if field not in {"title","location"}:
+            raise RuntimeError("不支援的修改項目")
+        payload["edit_field"] = field
+        set_operation_state(user_id,"family_calendar_edit",f"waiting_calendar_edit_{field}",payload)
+        reply_text(event.reply_token,
+            ("請輸入新的行程名稱：" if field == "title" else "請輸入新的地點：")
+            + "\n輸入「取消」可結束。")
+        return True
+
+    if action == "family_calendar_save_datetime":
+        state = get_operation_state(user_id)
+        payload = state.get("payload",{}) if state else {}
+        dt_value = getattr(getattr(event.postback,"params",None),"datetime",None)
+        if not dt_value:
+            raise RuntimeError("沒有取得選擇的日期時間")
+        selected_dt = datetime.fromisoformat(dt_value)
+        mode = params.get("mode",[None])[0]
+
+        if mode == "add":
+            required = {"patient_id","calendar_title","calendar_location"}
+            if not required.issubset(payload):
+                raise RuntimeError("新增行程資料已逾時")
+            create_patient_calendar_event(
+                payload["patient_id"],payload["calendar_title"],
+                payload.get("calendar_description"),payload.get("calendar_location"),
+                selected_dt,admin_id)
+            clear_operation_state(user_id)
+            reply_text(event.reply_token,
+                f"行程新增完成！\n長者：{payload['patient_name']}\n"
+                f"行程：{payload['calendar_title']}\n"
+                f"時間：{selected_dt.strftime('%Y-%m-%d %H:%M')}\n"
+                f"地點：{payload.get('calendar_location') or '未填寫'}")
+            return True
+
+        if mode == "edit":
+            if not payload.get("event_id") or not payload.get("patient_id"):
+                raise RuntimeError("修改行程資料已逾時")
+            update_patient_calendar_event(
+                payload["event_id"],payload["patient_id"],"starts_at",selected_dt)
+            clear_operation_state(user_id)
+            reply_text(event.reply_token,
+                f"行程日期時間修改完成！\n行程：{payload['event_title']}\n"
+                f"新時間：{selected_dt.strftime('%Y-%m-%d %H:%M')}")
+            return True
+        raise RuntimeError("無法判斷日期時間操作")
+
+    if action == "family_calendar_confirm_delete":
+        state = get_operation_state(user_id)
+        payload = state.get("payload",{}) if state else {}
+        if not payload.get("event_id") or not payload.get("patient_id"):
+            raise RuntimeError("刪除資料已逾時")
+        delete_patient_calendar_event(payload["event_id"],payload["patient_id"])
+        clear_operation_state(user_id)
+        reply_text(event.reply_token,
+            f"已刪除行程：{payload.get('event_title') or '未命名行程'}")
+        return True
+
+    if action in {"family_calendar_enable_reminder","family_calendar_disable_reminder"}:
+        state = get_operation_state(user_id)
+        payload = state.get("payload",{}) if state else {}
+        patient_id = payload.get("patient_id")
+        if not patient_id or not get_family_patient(family_id,patient_id):
+            raise RuntimeError("提醒設定資料已逾時")
+        enabled = action == "family_calendar_enable_reminder"
+        save_followup_reminder_setting(
+            patient_id,admin_id,enabled,days_before=3,reminder_time="09:00")
+        clear_operation_state(user_id)
+        reply_text(event.reply_token,
+            f"{payload.get('patient_name','長者')}的回診提醒已{'開啟' if enabled else '關閉'}。"
+            + ("\n系統將在回診日前 3 天上午 09:00 排入通知。" if enabled else ""))
+        return True
     return False
 
 # =========================================================
