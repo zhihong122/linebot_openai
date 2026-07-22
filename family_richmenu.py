@@ -161,13 +161,58 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
+                    "bounds": {"x": 35, "y": 251, "width": 798, "height": 665},
+                    "action": {
+                        "type": "postback",
+                        "label": "查看藥物",
+                        "data": "action=family_medication_list",
+                        "displayText": "查看藥物",
+                    },
+                },
+                {
+                    "bounds": {"x": 855, "y": 251, "width": 827, "height": 671},
+                    "action": {
+                        "type": "postback",
+                        "label": "修正藥物",
+                        "data": "action=family_medication_correct",
+                        "displayText": "修正藥物",
+                    },
+                },
+                {
+                    "bounds": {"x": 1701, "y": 254, "width": 772, "height": 665},
+                    "action": {
+                        "type": "postback",
+                        "label": "藥量剩餘",
+                        "data": "action=family_medication_remaining",
+                        "displayText": "藥量剩餘",
+                    },
+                },
+                {
+                    "bounds": {"x": 38, "y": 935, "width": 792, "height": 740},
+                    "action": {
+                        "type": "postback",
+                        "label": "藥快用完",
+                        "data": "action=family_medication_low",
+                        "displayText": "藥快用完",
+                    },
+                },
+                {
+                    "bounds": {"x": 852, "y": 941, "width": 826, "height": 741},
+                    "action": {
+                        "type": "postback",
+                        "label": "藥袋紀錄",
+                        "data": "action=family_medication_bag_records",
+                        "displayText": "藥袋紀錄",
+                    },
+                },
+                {
                     "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "family_main",
                         "data": "switch-to-family-main",
                     },
-                }
+                },
             ],
         },
         "image": "family_medication_menu.jpg",
