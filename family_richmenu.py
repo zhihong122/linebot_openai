@@ -96,13 +96,58 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
+                    "bounds": {"x": 35, "y": 251, "width": 798, "height": 665},
+                    "action": {
+                        "type": "postback",
+                        "label": "新增長者",
+                        "data": "action=family_add_elder",
+                        "displayText": "新增長者",
+                    },
+                },
+                {
+                    "bounds": {"x": 855, "y": 251, "width": 827, "height": 671},
+                    "action": {
+                        "type": "postback",
+                        "label": "管理長者",
+                        "data": "action=family_manage_elder",
+                        "displayText": "管理長者",
+                    },
+                },
+                {
+                    "bounds": {"x": 1701, "y": 254, "width": 772, "height": 665},
+                    "action": {
+                        "type": "postback",
+                        "label": "新增看護",
+                        "data": "action=family_add_caregiver",
+                        "displayText": "新增看護",
+                    },
+                },
+                {
+                    "bounds": {"x": 38, "y": 935, "width": 792, "height": 740},
+                    "action": {
+                        "type": "postback",
+                        "label": "指派看護",
+                        "data": "action=family_assign_caregiver",
+                        "displayText": "指派看護",
+                    },
+                },
+                {
+                    "bounds": {"x": 852, "y": 941, "width": 826, "height": 741},
+                    "action": {
+                        "type": "postback",
+                        "label": "家庭群組 ID",
+                        "data": "action=family_bind_group",
+                        "displayText": "家庭群組 ID",
+                    },
+                },
+                {
                     "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "family_main",
                         "data": "switch-to-family-main",
                     },
-                }
+                },
             ],
         },
         "image": "family_management_menu.jpg",
