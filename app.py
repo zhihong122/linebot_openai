@@ -28,6 +28,7 @@ from linebot.v3.webhooks import (
     ImageMessageContent,
     PostbackEvent,
     FollowEvent,
+    JoinEvent,
 )
 
 
@@ -960,6 +961,60 @@ def handle_follow(event):
 
     except Exception:
         app.logger.error(traceback.format_exc())
+
+
+# =========================================================
+# Bot 加入群組／多人聊天室
+# =========================================================
+
+@handler.add(JoinEvent)
+def handle_join(event):
+    """
+    Bot 被加入 LINE 群組或多人聊天室時，
+    將群組 ID 印到 Render 日誌，並直接回覆在聊天室中。
+    """
+    source = getattr(event, "source", None)
+    source_type = getattr(source, "type", None)
+
+    if source_type == "group":
+        group_id = getattr(source, "group_id", None)
+        id_label = "LINE 群組 ID"
+    elif source_type == "room":
+        group_id = getattr(source, "room_id", None)
+        id_label = "LINE 多人聊天室 ID"
+    else:
+        app.logger.warning(
+            "收到 JoinEvent，但來源類型無法辨識：%s",
+            source_type,
+        )
+        return
+
+    if not group_id:
+        app.logger.warning(
+            "收到 JoinEvent，但無法取得群組／聊天室 ID"
+        )
+        return
+
+    # Render Logs 會看到這一行。
+    app.logger.info(
+        "Bot 已加入 %s，ID=%s",
+        source_type,
+        group_id,
+    )
+    print(
+        f"Bot 已加入 {source_type}，{id_label}：{group_id}",
+        flush=True,
+    )
+
+    reply_text(
+        event.reply_token,
+        (
+            "Bot 已成功加入此群組。\n\n"
+            f"{id_label}：\n{group_id}\n\n"
+            "請複製這組 ID，回到 Bot 私人聊天室，"
+            "再使用「綁定家庭群組」功能完成綁定。"
+        ),
+    )
 
 
 # =========================================================
