@@ -226,13 +226,41 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
+                    "bounds": {"x": 35, "y": 251, "width": 798, "height": 665},
+                    "action": {"type": "postback", "label": "查看行事曆",
+                               "data": "action=family_calendar_view",
+                               "displayText": "查看行事曆"},
+                },
+                {
+                    "bounds": {"x": 855, "y": 251, "width": 827, "height": 671},
+                    "action": {"type": "postback", "label": "新增行程",
+                               "data": "action=family_calendar_add",
+                               "displayText": "新增行程"},
+                },
+                {
+                    "bounds": {"x": 1701, "y": 254, "width": 772, "height": 665},
+                    "action": {"type": "postback", "label": "修改行程",
+                               "data": "action=family_calendar_edit",
+                               "displayText": "修改行程"},
+                },
+                {
+                    "bounds": {"x": 38, "y": 935, "width": 792, "height": 740},
+                    "action": {"type": "postback", "label": "刪除行程",
+                               "data": "action=family_calendar_delete",
+                               "displayText": "刪除行程"},
+                },
+                {
+                    "bounds": {"x": 852, "y": 941, "width": 826, "height": 741},
+                    "action": {"type": "postback", "label": "回診提醒",
+                               "data": "action=family_calendar_reminder",
+                               "displayText": "回診提醒"},
+                },
+                {
                     "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
-                    "action": {
-                        "type": "richmenuswitch",
-                        "richMenuAliasId": "family_main",
-                        "data": "switch-to-family-main",
-                    },
-                }
+                    "action": {"type": "richmenuswitch",
+                               "richMenuAliasId": "family_main",
+                               "data": "switch-to-family-main"},
+                },
             ],
         },
         "image": "family_calendar_menu.jpg",
