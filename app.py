@@ -149,10 +149,16 @@ def get_db_connection():
 
     try:
         import psycopg2
+        from psycopg2.extras import register_uuid
     except ImportError as error:
         raise RuntimeError(
             "使用 PostgreSQL 時需安裝 psycopg2-binary"
         ) from error
+
+    # 讓 psycopg2 能直接處理 PostgreSQL UUID 欄位。
+    # 否則從資料庫 SELECT 出來的 uuid.UUID 物件再次作為參數寫入時，
+    # 會出現：can't adapt type 'UUID'。
+    register_uuid()
 
     return psycopg2.connect(DATABASE_URL)
 
