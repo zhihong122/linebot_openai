@@ -2,6 +2,10 @@ from flask import Flask, request, abort
 import os
 import json
 import traceback
+import math
+import re
+from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from urllib.parse import parse_qs
 
 import requests
@@ -857,6 +861,15 @@ FAMILY_ACTIONS = {
     "family_select_caregiver",
     "family_select_elder_for_caregiver",
     "family_confirm_assignment",
+    "family_medication_list",
+    "family_medication_correct",
+    "family_medication_remaining",
+    "family_medication_low",
+    "family_medication_bag_records",
+    "family_medication_select_patient",
+    "family_medication_select_item",
+    "family_medication_select_bag",
+    "family_medication_confirm_quantity",
     "family_cancel",
 }
 
@@ -1130,10 +1143,45 @@ def handle_family_text_input(event, user_text, user_id):
         clear_operation_state(user_id)
         reply_text(event.reply_token,f"家庭群組綁定完成！\nGroup ID：{user_text}")
         return True
+    if state["step"] == "waiting_actual_quantity":
+        payload = state.get("payload", {})
+        actual_quantity = _parse_numeric_quantity(user_text)
+        payload["actual_quantity"] = str(actual_quantity)
+        set_operation_state(
+            user_id,
+            "family_medication_correct",
+            "confirm_actual_quantity",
+            payload,
+        )
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                (
+                    f"長者：{payload['patient_name']}\n"
+                    f"藥物：{payload['medication_name']}\n"
+                    f"系統計算：{_format_quantity(payload['calculated_quantity'])} "
+                    f"{payload['quantity_unit']}\n"
+                    f"實際剩餘：{_format_quantity(actual_quantity)} "
+                    f"{payload['quantity_unit']}\n\n"
+                    "確定儲存這次修正？"
+                ),
+                [
+                    postback_item(
+                        "確認修正",
+                        "action=family_medication_confirm_quantity",
+                    ),
+                    postback_item("取消", "action=family_cancel"),
+                ],
+            ),
+        )
+        return True
     return False
 
 
 def handle_family_postback(event, action, params):
+    if action.startswith("family_medication_"):
+        return handle_family_medication_postback(event, action, params)
+
     user_id=get_user_id(event)
     if not user_id:
         reply_text(event.reply_token,"無法取得您的 LINE User ID。")
@@ -1150,7 +1198,9 @@ def handle_family_postback(event, action, params):
         if not state or not state.get("payload",{}).get("target_id"):
             raise RuntimeError("新增資料已逾時，請重新操作")
         import uuid
-        bind_member_to_family(family_id,uuid.UUID(state["payload"]["target_id"]),"elderly",admin_id)
+        elder_uuid = uuid.UUID(state["payload"]["target_id"])
+        bind_member_to_family(family_id,elder_uuid,"elderly",admin_id)
+        ensure_patient_for_elder_user(elder_uuid)
         clear_operation_state(user_id)
         reply_text(event.reply_token,f"已成功新增長者：{state['payload'].get('display_name') or '未命名'}")
     elif action == "family_manage_elder":
@@ -1217,6 +1267,662 @@ def handle_family_postback(event, action, params):
     else:
         return False
     return True
+
+
+# =========================================================
+# 家屬藥物管理
+# =========================================================
+
+MEDICATION_ACTION_LABELS = {
+    "family_medication_list": "查看藥物",
+    "family_medication_correct": "修正藥物",
+    "family_medication_remaining": "藥量剩餘",
+    "family_medication_low": "藥快用完",
+    "family_medication_bag_records": "藥袋紀錄",
+}
+
+
+def _to_decimal(value, default=Decimal("0")):
+    if value is None:
+        return default
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return default
+
+
+def _format_quantity(value):
+    number = _to_decimal(value)
+    if number == number.to_integral():
+        return str(int(number))
+    return format(number.normalize(), "f")
+
+
+def _parse_numeric_quantity(text_value):
+    match = re.search(r"-?\d+(?:\.\d+)?", str(text_value or ""))
+    if not match:
+        raise RuntimeError("請輸入數字，例如：27")
+    value = Decimal(match.group())
+    if value < 0:
+        raise RuntimeError("藥物數量不能小於 0")
+    return value
+
+
+def ensure_patient_for_elder_user(elder_user_id):
+    """取得長者的 patients.id；家庭新增長者後若尚未建檔就自動建立。"""
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT p.id, p.full_name
+            FROM patients p
+            WHERE p.linked_user_id = %s
+            ORDER BY p.is_active DESC, p.updated_at DESC
+            LIMIT 1
+            """,
+            (elder_user_id,),
+        )
+        row = cursor.fetchone()
+        if row:
+            if not row[1]:
+                cursor.execute(
+                    """
+                    UPDATE patients p
+                    SET full_name = COALESCE(u.display_name, '未命名長者'),
+                        is_active = TRUE,
+                        updated_at = CURRENT_TIMESTAMP
+                    FROM app_users u
+                    WHERE p.id = %s AND u.id = %s
+                    """,
+                    (row[0], elder_user_id),
+                )
+                connection.commit()
+            return row[0]
+
+        cursor.execute(
+            "SELECT COALESCE(NULLIF(display_name,''), '未命名長者') FROM app_users WHERE id=%s",
+            (elder_user_id,),
+        )
+        user_row = cursor.fetchone()
+        if not user_row:
+            raise RuntimeError("找不到長者使用者資料")
+
+        cursor.execute(
+            """
+            INSERT INTO patients (linked_user_id, full_name, notes, is_active)
+            VALUES (%s, %s, '由家庭管理功能自動建立', TRUE)
+            RETURNING id
+            """,
+            (elder_user_id, user_row[0]),
+        )
+        patient_id = cursor.fetchone()[0]
+        connection.commit()
+        return patient_id
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def list_family_patients(family_id):
+    """列出家庭中所有有效長者，以及其 patient_id。"""
+    elders = list_family_members(family_id, "elderly")
+    result = []
+    for elder in elders:
+        patient_id = ensure_patient_for_elder_user(elder["id"])
+        item = dict(elder)
+        item["patient_id"] = patient_id
+        result.append(item)
+    return result
+
+
+def get_family_patient(family_id, patient_id):
+    for patient in list_family_patients(family_id):
+        if str(patient["patient_id"]) == str(patient_id):
+            return patient
+    return None
+
+
+def _medication_inventory_values(row, today=None):
+    today = today or date.today()
+    dispense_date = row.get("dispense_date") or row.get("start_date")
+    course_days = row.get("course_days")
+    total_quantity = _to_decimal(row.get("total_quantity"))
+    dose_per_time = _to_decimal(row.get("dose_per_time"), Decimal("1"))
+    times_per_day = _to_decimal(row.get("times_per_day"), Decimal("1"))
+    daily_quantity = max(dose_per_time * times_per_day, Decimal("0"))
+
+    if dispense_date and isinstance(dispense_date, datetime):
+        dispense_date = dispense_date.date()
+
+    elapsed_days = max((today - dispense_date).days, 0) if dispense_date else 0
+    calculated = max(total_quantity - (Decimal(elapsed_days) * daily_quantity), Decimal("0"))
+
+    adjusted_quantity = row.get("adjusted_quantity")
+    adjusted_at = row.get("adjusted_at")
+    if adjusted_quantity is not None and adjusted_at:
+        adjusted_date = adjusted_at.date() if isinstance(adjusted_at, datetime) else adjusted_at
+        adjusted_elapsed = max((today - adjusted_date).days, 0)
+        remaining = max(
+            _to_decimal(adjusted_quantity) - (Decimal(adjusted_elapsed) * daily_quantity),
+            Decimal("0"),
+        )
+        basis = f"人工修正（{adjusted_date}）"
+    else:
+        remaining = calculated
+        basis = "依調劑日期與每日用量計算"
+
+    if course_days and dispense_date:
+        expected_end_date = dispense_date + timedelta(days=max(int(course_days) - 1, 0))
+    elif row.get("end_date"):
+        expected_end_date = row["end_date"]
+    elif daily_quantity > 0 and total_quantity > 0 and dispense_date:
+        expected_end_date = dispense_date + timedelta(
+            days=max(math.ceil(float(total_quantity / daily_quantity)) - 1, 0)
+        )
+    else:
+        expected_end_date = None
+
+    warning_date = expected_end_date - timedelta(days=3) if expected_end_date else None
+    days_remaining = (
+        math.ceil(float(remaining / daily_quantity))
+        if daily_quantity > 0
+        else None
+    )
+
+    return {
+        "dispense_date": dispense_date,
+        "course_days": course_days,
+        "total_quantity": total_quantity,
+        "daily_quantity": daily_quantity,
+        "elapsed_days": elapsed_days,
+        "remaining": remaining,
+        "basis": basis,
+        "expected_end_date": expected_end_date,
+        "warning_date": warning_date,
+        "days_remaining": days_remaining,
+    }
+
+
+def list_patient_medications(patient_id, active_only=True):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                m.id,
+                m.medication_name,
+                m.generic_name,
+                m.dosage,
+                m.instructions,
+                m.start_date,
+                m.end_date,
+                m.is_active,
+                m.dispense_date,
+                m.course_days,
+                m.total_quantity,
+                m.dose_per_time,
+                m.times_per_day,
+                m.quantity_unit,
+                a.actual_quantity,
+                a.created_at
+            FROM medications m
+            LEFT JOIN LATERAL (
+                SELECT actual_quantity, created_at
+                FROM medication_inventory_adjustments mia
+                WHERE mia.medication_id = m.id
+                ORDER BY mia.created_at DESC
+                LIMIT 1
+            ) a ON TRUE
+            WHERE m.patient_id = %s
+              AND (%s = FALSE OR m.is_active = TRUE)
+            ORDER BY COALESCE(m.dispense_date, m.start_date) DESC NULLS LAST,
+                     m.created_at DESC
+            """,
+            (patient_id, active_only),
+        )
+        rows = cursor.fetchall()
+        result = []
+        for row in rows:
+            result.append({
+                "id": row[0],
+                "medication_name": row[1] or "未命名藥物",
+                "generic_name": row[2],
+                "dosage": row[3],
+                "instructions": row[4],
+                "start_date": row[5],
+                "end_date": row[6],
+                "is_active": row[7],
+                "dispense_date": row[8],
+                "course_days": row[9],
+                "total_quantity": row[10],
+                "dose_per_time": row[11],
+                "times_per_day": row[12],
+                "quantity_unit": row[13] or "份",
+                "adjusted_quantity": row[14],
+                "adjusted_at": row[15],
+            })
+        return result
+    finally:
+        connection.close()
+
+
+def get_patient_medication(patient_id, medication_id):
+    for medication in list_patient_medications(patient_id, active_only=False):
+        if str(medication["id"]) == str(medication_id):
+            return medication
+    return None
+
+
+def save_inventory_adjustment(
+    medication_id,
+    patient_id,
+    adjusted_by,
+    calculated_quantity,
+    actual_quantity,
+    reason="家屬修正實際剩餘數量",
+):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO medication_inventory_adjustments (
+                medication_id,
+                patient_id,
+                adjusted_by,
+                calculated_quantity,
+                actual_quantity,
+                quantity_difference,
+                reason
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (
+                medication_id,
+                patient_id,
+                adjusted_by,
+                calculated_quantity,
+                actual_quantity,
+                actual_quantity - calculated_quantity,
+                reason,
+            ),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def list_medication_bag_records(patient_id, limit=12):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                s.id,
+                s.created_at,
+                s.processing_status,
+                s.original_text,
+                s.parsed_result,
+                s.image_path,
+                COALESCE(u.display_name, '未知使用者'),
+                COALESCE(r.name_zh_tw, r.code, '未知身份')
+            FROM ai_medication_scans s
+            LEFT JOIN app_users u ON u.id = s.uploaded_by
+            LEFT JOIN roles r ON r.id = u.role_id
+            WHERE s.patient_id = %s
+            ORDER BY s.created_at DESC
+            LIMIT %s
+            """,
+            (patient_id, limit),
+        )
+        rows = cursor.fetchall()
+        return [{
+            "id": r[0],
+            "created_at": r[1],
+            "status": r[2],
+            "original_text": r[3],
+            "parsed_result": r[4],
+            "image_path": r[5],
+            "uploader_name": r[6],
+            "uploader_role": r[7],
+        } for r in rows]
+    finally:
+        connection.close()
+
+
+def get_medication_bag_record(patient_id, scan_id):
+    records = list_medication_bag_records(patient_id, limit=50)
+    for record in records:
+        if str(record["id"]) == str(scan_id):
+            return record
+    return None
+
+
+def send_patient_selection(event, user_id, action, family_id):
+    patients = list_family_patients(family_id)
+    if not patients:
+        reply_text(event.reply_token, "目前家庭尚未新增任何長者。請先到「家庭管理」新增長者。")
+        return True
+
+    set_operation_state(user_id, action, "select_patient", {})
+    if len(patients) == 1:
+        patient = patients[0]
+        return handle_selected_patient(event, user_id, action, patient)
+
+    items = [
+        postback_item(
+            p["display_name"],
+            f"action=family_medication_select_patient&next_action={action}&patient_id={p['patient_id']}",
+            f"選擇 {p['display_name']}",
+        )
+        for p in patients[:12]
+    ]
+    reply_message(
+        event.reply_token,
+        make_quick_reply_message(
+            f"{MEDICATION_ACTION_LABELS.get(action, '藥物管理')}\n請選擇長者：",
+            items,
+        ),
+    )
+    return True
+
+
+def medication_summary_text(patient, medications):
+    if not medications:
+        return f"{patient['display_name']}目前沒有使用中的藥物。"
+
+    lines = [f"{patient['display_name']}目前使用中的藥物："]
+    for index, medication in enumerate(medications, 1):
+        inventory = _medication_inventory_values(medication)
+        lines.extend([
+            "",
+            f"{index}. {medication['medication_name']}",
+            f"含量：{medication.get('dosage') or '未標示'}",
+            f"用法：{medication.get('instructions') or '未標示'}",
+            f"調劑日期：{inventory['dispense_date'] or '未標示'}",
+            f"處方天數：{inventory['course_days'] or '未標示'}",
+            f"總量：{_format_quantity(inventory['total_quantity'])} {medication['quantity_unit']}",
+        ])
+    return "\n".join(lines)
+
+
+def remaining_summary_text(patient, medications, low_only=False):
+    lines = [
+        (
+            f"{patient['display_name']}三天內可能用完的藥物："
+            if low_only
+            else f"{patient['display_name']}的藥物剩餘："
+        )
+    ]
+    matched = 0
+    today = date.today()
+
+    for medication in medications:
+        inventory = _medication_inventory_values(medication, today=today)
+        low = False
+        if inventory["warning_date"] and inventory["expected_end_date"]:
+            low = inventory["warning_date"] <= today <= inventory["expected_end_date"]
+        if inventory["daily_quantity"] > 0:
+            low = low or inventory["remaining"] <= inventory["daily_quantity"] * Decimal("3")
+
+        if low_only and not low:
+            continue
+
+        matched += 1
+        lines.extend([
+            "",
+            f"{matched}. {medication['medication_name']}",
+            f"目前剩餘：{_format_quantity(inventory['remaining'])} {medication['quantity_unit']}",
+            f"每日使用：{_format_quantity(inventory['daily_quantity'])} {medication['quantity_unit']}",
+            f"已經過：{inventory['elapsed_days']} 天",
+            f"預計用完：{inventory['expected_end_date'] or '無法計算'}",
+            f"計算基準：{inventory['basis']}",
+        ])
+        if inventory["days_remaining"] is not None:
+            lines.append(f"預估還可使用：{inventory['days_remaining']} 天")
+
+    if matched == 0:
+        return (
+            f"{patient['display_name']}目前沒有三天內即將用完的藥物。"
+            if low_only
+            else f"{patient['display_name']}目前沒有可計算剩餘量的藥物。"
+        )
+    return "\n".join(lines)
+
+
+def handle_selected_patient(event, user_id, action, patient):
+    patient_id = patient["patient_id"]
+    payload = {
+        "patient_id": str(patient_id),
+        "patient_name": patient["display_name"],
+    }
+
+    if action == "family_medication_list":
+        clear_operation_state(user_id)
+        reply_text(
+            event.reply_token,
+            medication_summary_text(
+                patient,
+                list_patient_medications(patient_id, active_only=True),
+            ),
+        )
+        return True
+
+    if action == "family_medication_remaining":
+        clear_operation_state(user_id)
+        reply_text(
+            event.reply_token,
+            remaining_summary_text(
+                patient,
+                list_patient_medications(patient_id, active_only=True),
+                low_only=False,
+            ),
+        )
+        return True
+
+    if action == "family_medication_low":
+        clear_operation_state(user_id)
+        reply_text(
+            event.reply_token,
+            remaining_summary_text(
+                patient,
+                list_patient_medications(patient_id, active_only=True),
+                low_only=True,
+            ),
+        )
+        return True
+
+    if action == "family_medication_correct":
+        medications = list_patient_medications(patient_id, active_only=True)
+        if not medications:
+            clear_operation_state(user_id)
+            reply_text(event.reply_token, f"{patient['display_name']}目前沒有可修正的藥物。")
+            return True
+        set_operation_state(user_id, action, "select_medication", payload)
+        items = [
+            postback_item(
+                m["medication_name"][:20],
+                f"action=family_medication_select_item&medication_id={m['id']}",
+            )
+            for m in medications[:12]
+        ]
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                f"長者：{patient['display_name']}\n請選擇要修正數量的藥物：",
+                items,
+            ),
+        )
+        return True
+
+    if action == "family_medication_bag_records":
+        records = list_medication_bag_records(patient_id)
+        if not records:
+            clear_operation_state(user_id)
+            reply_text(event.reply_token, f"{patient['display_name']}目前沒有藥袋拍攝紀錄。")
+            return True
+        set_operation_state(user_id, action, "select_bag_record", payload)
+        items = []
+        for record in records[:12]:
+            created = record["created_at"].strftime("%Y-%m-%d %H:%M")
+            items.append(
+                postback_item(
+                    created[:20],
+                    f"action=family_medication_select_bag&scan_id={record['id']}",
+                    f"查看 {created}",
+                )
+            )
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                f"{patient['display_name']}的藥袋紀錄\n請選擇一筆：",
+                items,
+            ),
+        )
+        return True
+
+    return False
+
+
+def handle_family_medication_postback(event, action, params):
+    user_id = get_user_id(event)
+    if not user_id:
+        reply_text(event.reply_token, "無法取得您的 LINE User ID。")
+        return True
+
+    family = ensure_family_admin(user_id)
+    family_id = family["id"]
+    admin_id = family["admin_user_id"]
+
+    if action in MEDICATION_ACTION_LABELS:
+        return send_patient_selection(event, user_id, action, family_id)
+
+    if action == "family_medication_select_patient":
+        next_action = params.get("next_action", [None])[0]
+        patient_id = params.get("patient_id", [None])[0]
+        patient = get_family_patient(family_id, patient_id)
+        if not patient:
+            raise RuntimeError("找不到這位長者，或長者已不在此家庭")
+        if next_action not in MEDICATION_ACTION_LABELS:
+            raise RuntimeError("藥物功能資料已逾時")
+        return handle_selected_patient(event, user_id, next_action, patient)
+
+    if action == "family_medication_select_item":
+        state = get_operation_state(user_id)
+        medication_id = params.get("medication_id", [None])[0]
+        payload = state.get("payload", {}) if state else {}
+        patient_id = payload.get("patient_id")
+        patient = get_family_patient(family_id, patient_id)
+        medication = (
+            get_patient_medication(patient_id, medication_id)
+            if patient and patient_id
+            else None
+        )
+        if not patient or not medication:
+            raise RuntimeError("修正資料已逾時，請重新操作")
+
+        inventory = _medication_inventory_values(medication)
+        payload.update({
+            "medication_id": str(medication["id"]),
+            "medication_name": medication["medication_name"],
+            "calculated_quantity": str(inventory["remaining"]),
+            "quantity_unit": medication["quantity_unit"],
+        })
+        set_operation_state(
+            user_id,
+            "family_medication_correct",
+            "waiting_actual_quantity",
+            payload,
+        )
+        reply_text(
+            event.reply_token,
+            (
+                f"長者：{patient['display_name']}\n"
+                f"藥物：{medication['medication_name']}\n"
+                f"系統計算剩餘：{_format_quantity(inventory['remaining'])} "
+                f"{medication['quantity_unit']}\n\n"
+                "請輸入實際剩餘數量，例如：27\n"
+                "輸入「取消」可結束操作。"
+            ),
+        )
+        return True
+
+    if action == "family_medication_confirm_quantity":
+        state = get_operation_state(user_id)
+        payload = state.get("payload", {}) if state else {}
+        required = {
+            "patient_id",
+            "medication_id",
+            "actual_quantity",
+            "calculated_quantity",
+        }
+        if not required.issubset(payload):
+            raise RuntimeError("修正資料已逾時，請重新操作")
+
+        patient = get_family_patient(family_id, payload["patient_id"])
+        if not patient:
+            raise RuntimeError("找不到這位長者")
+
+        save_inventory_adjustment(
+            medication_id=payload["medication_id"],
+            patient_id=payload["patient_id"],
+            adjusted_by=admin_id,
+            calculated_quantity=_to_decimal(payload["calculated_quantity"]),
+            actual_quantity=_to_decimal(payload["actual_quantity"]),
+        )
+        clear_operation_state(user_id)
+        reply_text(
+            event.reply_token,
+            (
+                "藥物數量修正完成！\n"
+                f"長者：{payload['patient_name']}\n"
+                f"藥物：{payload['medication_name']}\n"
+                f"原計算：{_format_quantity(payload['calculated_quantity'])} "
+                f"{payload['quantity_unit']}\n"
+                f"修正後：{_format_quantity(payload['actual_quantity'])} "
+                f"{payload['quantity_unit']}"
+            ),
+        )
+        return True
+
+    if action == "family_medication_select_bag":
+        state = get_operation_state(user_id)
+        payload = state.get("payload", {}) if state else {}
+        patient_id = payload.get("patient_id")
+        scan_id = params.get("scan_id", [None])[0]
+        patient = get_family_patient(family_id, patient_id)
+        record = get_medication_bag_record(patient_id, scan_id) if patient else None
+        if not patient or not record:
+            raise RuntimeError("藥袋紀錄已逾時，請重新操作")
+
+        clear_operation_state(user_id)
+        parsed = record.get("parsed_result")
+        if parsed:
+            details = json.dumps(parsed, ensure_ascii=False, indent=2)
+        else:
+            details = record.get("original_text") or "未保存辨識內容"
+
+        reply_text(
+            event.reply_token,
+            (
+                f"長者：{patient['display_name']}\n"
+                f"拍攝時間：{record['created_at'].strftime('%Y-%m-%d %H:%M')}\n"
+                f"上傳者：{record['uploader_name']}（{record['uploader_role']}）\n"
+                f"辨識狀態：{record['status']}\n\n"
+                f"{details}"
+            ),
+        )
+        return True
+
+    return False
 
 # =========================================================
 # OpenAI
