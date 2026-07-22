@@ -270,9 +270,54 @@ MENU_DEFINITIONS = {
         "menu": {
             "size": {"width": 2500, "height": 1686},
             "selected": True,
-            "name": "家屬報告紀錄",
+            "name": "家屬報表紀錄",
             "chatBarText": "返回主選單",
             "areas": [
+                {
+                    "bounds": {"x": 35, "y": 251, "width": 798, "height": 665},
+                    "action": {
+                        "type": "postback",
+                        "label": "今日紀錄",
+                        "data": "action=family_report_today",
+                        "displayText": "今日紀錄",
+                    },
+                },
+                {
+                    "bounds": {"x": 855, "y": 251, "width": 827, "height": 671},
+                    "action": {
+                        "type": "postback",
+                        "label": "7天紀錄",
+                        "data": "action=family_report_7days",
+                        "displayText": "7天紀錄",
+                    },
+                },
+                {
+                    "bounds": {"x": 1701, "y": 254, "width": 772, "height": 665},
+                    "action": {
+                        "type": "postback",
+                        "label": "30天紀錄",
+                        "data": "action=family_report_30days",
+                        "displayText": "30天紀錄",
+                    },
+                },
+                {
+                    "bounds": {"x": 38, "y": 935, "width": 792, "height": 740},
+                    "action": {
+                        "type": "postback",
+                        "label": "異常統計",
+                        "data": "action=family_report_abnormal",
+                        "displayText": "異常統計",
+                    },
+                },
+                {
+                    "bounds": {"x": 852, "y": 941, "width": 826, "height": 741},
+                    "action": {
+                        "type": "postback",
+                        "label": "匯出摘要",
+                        "data": "action=family_report_summary",
+                        "displayText": "匯出摘要",
+                    },
+                },
                 {
                     "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
                     "action": {
@@ -280,7 +325,7 @@ MENU_DEFINITIONS = {
                         "richMenuAliasId": "family_main",
                         "data": "switch-to-family-main",
                     },
-                }
+                },
             ],
         },
         "image": "family_report_menu.jpg",
