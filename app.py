@@ -883,6 +883,12 @@ FAMILY_ACTIONS = {
     "family_calendar_confirm_delete",
     "family_calendar_enable_reminder",
     "family_calendar_disable_reminder",
+    "family_report_today",
+    "family_report_7days",
+    "family_report_30days",
+    "family_report_abnormal",
+    "family_report_summary",
+    "family_report_select_patient",
     "family_cancel",
 }
 
@@ -1245,6 +1251,9 @@ def handle_family_text_input(event, user_text, user_id):
 
 
 def handle_family_postback(event, action, params):
+    if action.startswith("family_report_"):
+        return handle_family_report_postback(event, action, params)
+
     if action.startswith("family_calendar_"):
         return handle_family_calendar_postback(event, action, params)
 
@@ -2410,6 +2419,389 @@ def handle_family_calendar_postback(event,action,params):
             f"{payload.get('patient_name','長者')}的回診提醒已{'開啟' if enabled else '關閉'}。"
             + ("\n系統將在回診日前 3 天上午 09:00 排入通知。" if enabled else ""))
         return True
+    return False
+
+
+
+# =========================================================
+# 家屬報表紀錄
+# =========================================================
+
+REPORT_ACTIONS = {
+    "family_report_today": ("今日紀錄", 1),
+    "family_report_7days": ("7天紀錄", 7),
+    "family_report_30days": ("30天紀錄", 30),
+    "family_report_abnormal": ("異常統計", None),
+    "family_report_summary": ("匯出摘要", 30),
+}
+
+
+def list_patient_medication_logs(patient_id, days):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                ml.scheduled_at,
+                ml.taken_at,
+                ml.status::text,
+                ml.note,
+                COALESCE(m.medication_name, '未命名藥物'),
+                COALESCE(u.display_name, '未記錄')
+            FROM medication_logs ml
+            LEFT JOIN medications m ON m.id = ml.medication_id
+            LEFT JOIN app_users u ON u.id = ml.reported_by
+            WHERE ml.patient_id = %s
+              AND ml.scheduled_at >= CURRENT_TIMESTAMP - (%s * INTERVAL '1 day')
+            ORDER BY ml.scheduled_at DESC
+            """,
+            (patient_id, days),
+        )
+        return [{
+            "scheduled_at": row[0],
+            "taken_at": row[1],
+            "status": row[2],
+            "note": row[3],
+            "medication_name": row[4],
+            "reported_by": row[5],
+        } for row in cursor.fetchall()]
+    finally:
+        connection.close()
+
+
+def list_patient_abnormal_reports(patient_id, days=None):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                ar.id,
+                ar.report_type,
+                ar.severity,
+                ar.description,
+                ar.occurred_at,
+                ar.created_at,
+                COALESCE(u.display_name, '未知使用者'),
+                COALESCE(r.name_zh_tw, r.code, '未知身份')
+            FROM abnormal_reports ar
+            LEFT JOIN app_users u ON u.id = ar.reported_by
+            LEFT JOIN roles r ON r.id = u.role_id
+            WHERE ar.patient_id = %s
+              AND ar.is_active = TRUE
+              AND (%s IS NULL OR ar.occurred_at >= CURRENT_TIMESTAMP - (%s * INTERVAL '1 day'))
+            ORDER BY ar.occurred_at DESC, ar.created_at DESC
+            """,
+            (patient_id, days, days),
+        )
+        return [{
+            "id": row[0],
+            "report_type": row[1],
+            "severity": row[2],
+            "description": row[3],
+            "occurred_at": row[4],
+            "created_at": row[5],
+            "reporter_name": row[6],
+            "reporter_role": row[7],
+        } for row in cursor.fetchall()]
+    finally:
+        connection.close()
+
+
+def medication_log_report_text(patient, days):
+    logs = list_patient_medication_logs(patient["patient_id"], days)
+    title = "今日紀錄" if days == 1 else f"最近 {days} 天紀錄"
+
+    if not logs:
+        return f"{patient['display_name']}的{title}：\n目前沒有服藥紀錄。"
+
+    status_names = {
+        "scheduled": "待確認",
+        "taken": "已服藥",
+        "missed": "漏服",
+        "skipped": "略過",
+        "late": "延遲服藥",
+    }
+    counts = {}
+    for item in logs:
+        status = item["status"]
+        counts[status] = counts.get(status, 0) + 1
+
+    lines = [
+        f"{patient['display_name']}的{title}：",
+        "",
+        f"總紀錄：{len(logs)} 筆",
+        "狀態統計：" + "、".join(
+            f"{status_names.get(key, key)} {value} 筆"
+            for key, value in counts.items()
+        ),
+        "",
+        "紀錄明細：",
+    ]
+
+    for index, item in enumerate(logs[:30], 1):
+        scheduled = item["scheduled_at"].strftime("%Y-%m-%d %H:%M")
+        status = status_names.get(item["status"], item["status"])
+        lines.append(
+            f"{index}. {scheduled}｜{item['medication_name']}｜{status}"
+        )
+        if item.get("note"):
+            lines.append(f"   備註：{item['note']}")
+
+    if len(logs) > 30:
+        lines.append(f"\n其餘 {len(logs) - 30} 筆未顯示。")
+    return "\n".join(lines)
+
+
+def abnormal_report_text(patient):
+    records = list_patient_abnormal_reports(patient["patient_id"], days=None)
+    if not records:
+        return (
+            f"{patient['display_name']}目前沒有長者或看護回報的不舒服紀錄。"
+        )
+
+    severity_names = {
+        "mild": "輕微",
+        "moderate": "中等",
+        "severe": "嚴重",
+        "critical": "緊急",
+        "normal": "一般",
+    }
+    severity_count = {}
+    type_count = {}
+
+    for record in records:
+        severity = record.get("severity") or "未分級"
+        report_type = record.get("report_type") or "其他不舒服"
+        severity_count[severity] = severity_count.get(severity, 0) + 1
+        type_count[report_type] = type_count.get(report_type, 0) + 1
+
+    lines = [
+        f"{patient['display_name']}的不舒服紀錄統計：",
+        "",
+        f"總紀錄：{len(records)} 筆",
+        "程度統計：" + "、".join(
+            f"{severity_names.get(key, key)} {value} 筆"
+            for key, value in severity_count.items()
+        ),
+        "症狀統計：" + "、".join(
+            f"{key} {value} 筆"
+            for key, value in sorted(
+                type_count.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+        ),
+        "",
+        "所有不舒服紀錄：",
+    ]
+
+    for index, record in enumerate(records[:40], 1):
+        happened = record["occurred_at"].strftime("%Y-%m-%d %H:%M")
+        severity = severity_names.get(
+            record.get("severity"),
+            record.get("severity") or "未分級",
+        )
+        lines.extend([
+            (
+                f"{index}. {happened}｜"
+                f"{record.get('report_type') or '其他不舒服'}｜{severity}"
+            ),
+            (
+                f"   回報者：{record['reporter_name']}"
+                f"（{record['reporter_role']}）"
+            ),
+            f"   說明：{record.get('description') or '未填寫'}",
+        ])
+
+    if len(records) > 40:
+        lines.append(f"\n其餘 {len(records) - 40} 筆未顯示。")
+    return "\n".join(lines)
+
+
+def patient_medical_summary_text(patient):
+    medications = list_patient_medications(
+        patient["patient_id"],
+        active_only=True,
+    )
+    abnormal_records = list_patient_abnormal_reports(
+        patient["patient_id"],
+        days=None,
+    )
+
+    lines = [
+        "【長者用藥與不舒服摘要】",
+        f"長者：{patient['display_name']}",
+        f"產生時間：{datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "一、目前使用中的藥物",
+    ]
+
+    if not medications:
+        lines.append("目前沒有使用中的藥物。")
+    else:
+        for index, medication in enumerate(medications, 1):
+            inventory = _medication_inventory_values(medication)
+            lines.extend([
+                "",
+                f"{index}. {medication['medication_name']}",
+                f"含量：{medication.get('dosage') or '未標示'}",
+                f"用法：{medication.get('instructions') or '未標示'}",
+                f"調劑日期：{inventory['dispense_date'] or '未標示'}",
+                f"處方天數：{inventory['course_days'] or '未標示'}",
+                (
+                    "剩餘量："
+                    f"{_format_quantity(inventory['remaining'])} "
+                    f"{medication['quantity_unit']}"
+                ),
+            ])
+
+    lines.extend(["", "二、長者／看護回報的不舒服紀錄"])
+
+    if not abnormal_records:
+        lines.append("目前沒有不舒服紀錄。")
+    else:
+        for index, record in enumerate(abnormal_records[:30], 1):
+            happened = record["occurred_at"].strftime("%Y-%m-%d %H:%M")
+            lines.extend([
+                "",
+                (
+                    f"{index}. {happened}｜"
+                    f"{record.get('report_type') or '其他不舒服'}"
+                ),
+                (
+                    f"回報者：{record['reporter_name']}"
+                    f"（{record['reporter_role']}）"
+                ),
+                f"程度：{record.get('severity') or '未分級'}",
+                f"說明：{record.get('description') or '未填寫'}",
+            ])
+
+        if len(abnormal_records) > 30:
+            lines.append(
+                f"\n其餘 {len(abnormal_records) - 30} 筆未顯示。"
+            )
+
+    lines.extend([
+        "",
+        "此摘要僅整理系統內已有紀錄，不能替代醫師診斷。",
+    ])
+    return "\n".join(lines)
+
+
+def send_report_patient_selection(event, user_id, action, family_id):
+    patients = list_family_patients(family_id)
+    if not patients:
+        reply_text(
+            event.reply_token,
+            "目前家庭尚未新增長者，請先到「家庭管理」新增長者。",
+        )
+        return True
+
+    if len(patients) == 1:
+        return handle_report_selected_patient(
+            event,
+            user_id,
+            action,
+            patients[0],
+        )
+
+    set_operation_state(
+        user_id,
+        action,
+        "report_select_patient",
+        {},
+    )
+    items = [
+        postback_item(
+            patient["display_name"],
+            (
+                "action=family_report_select_patient"
+                f"&next_action={action}"
+                f"&patient_id={patient['patient_id']}"
+            ),
+            f"選擇 {patient['display_name']}",
+        )
+        for patient in patients[:12]
+    ]
+    reply_message(
+        event.reply_token,
+        make_quick_reply_message(
+            f"{REPORT_ACTIONS[action][0]}\n請選擇長者：",
+            items,
+        ),
+    )
+    return True
+
+
+def handle_report_selected_patient(event, user_id, action, patient):
+    clear_operation_state(user_id)
+
+    if action in {
+        "family_report_today",
+        "family_report_7days",
+        "family_report_30days",
+    }:
+        days = REPORT_ACTIONS[action][1]
+        reply_text(
+            event.reply_token,
+            medication_log_report_text(patient, days),
+        )
+        return True
+
+    if action == "family_report_abnormal":
+        reply_text(
+            event.reply_token,
+            abnormal_report_text(patient),
+        )
+        return True
+
+    if action == "family_report_summary":
+        reply_text(
+            event.reply_token,
+            patient_medical_summary_text(patient),
+        )
+        return True
+
+    return False
+
+
+def handle_family_report_postback(event, action, params):
+    user_id = get_user_id(event)
+    if not user_id:
+        reply_text(event.reply_token, "無法取得您的 LINE User ID。")
+        return True
+
+    family = ensure_family_admin(user_id)
+    family_id = family["id"]
+
+    if action in REPORT_ACTIONS:
+        return send_report_patient_selection(
+            event,
+            user_id,
+            action,
+            family_id,
+        )
+
+    if action == "family_report_select_patient":
+        next_action = params.get("next_action", [None])[0]
+        patient_id = params.get("patient_id", [None])[0]
+
+        if next_action not in REPORT_ACTIONS:
+            raise RuntimeError("報表功能資料已逾時")
+
+        patient = get_family_patient(family_id, patient_id)
+        if not patient:
+            raise RuntimeError("找不到這位長者，或長者已不在此家庭")
+
+        return handle_report_selected_patient(
+            event,
+            user_id,
+            next_action,
+            patient,
+        )
+
     return False
 
 # =========================================================
