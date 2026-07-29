@@ -27,6 +27,10 @@ from linebot.v3.messaging import (
     QuickReplyItem,
     PostbackAction,
     DatetimePickerAction,
+    CameraAction,
+    CameraRollAction,
+    URIAction,
+    PushMessageRequest,
 )
 from linebot.v3.webhooks import (
     MessageEvent,
@@ -861,6 +865,30 @@ ELDER_MEDICATION_ACTIONS = {
     "elder_taken_today",
     "elder_confirm_taken_meal",
     "elder_cancel",
+    "elder_medicine_list",
+    "elder_medicine_info",
+    "elder_medicine_remaining",
+    "elder_medicine_capture",
+    "elder_medicine_stop",
+    "elder_medicine_select",
+    "elder_medicine_confirm_stop",
+    "elder_discomfort_dizziness",
+    "elder_discomfort_headache",
+    "elder_discomfort_nausea",
+    "elder_discomfort_sleep",
+    "elder_discomfort_other",
+    "elder_discomfort_confirm",
+    "elder_calendar_view",
+    "elder_calendar_add",
+    "elder_calendar_edit",
+    "elder_calendar_delete",
+    "elder_calendar_reminder",
+    "elder_calendar_select_event",
+    "elder_calendar_save_datetime",
+    "elder_calendar_confirm_delete",
+    "elder_sos_contact1",
+    "elder_sos_contact2",
+    "elder_sos_notify_all",
 }
 
 
@@ -897,7 +925,12 @@ def taipei_now():
     return datetime.now(TAIPEI_TZ)
 
 
+
 def get_elder_patient_by_line_user_id(line_user_id):
+    """
+    取得長者使用者與 patient。
+    若使用者已是長者身份，但 patients 尚未建立，會自動建立基本長者資料。
+    """
     connection = get_db_connection()
     try:
         cursor = connection.cursor()
@@ -906,7 +939,7 @@ def get_elder_patient_by_line_user_id(line_user_id):
             SELECT
                 u.id,
                 COALESCE(NULLIF(u.display_name, ''), '長者'),
-                r.code,
+                LOWER(r.code),
                 p.id,
                 COALESCE(NULLIF(p.full_name, ''), NULLIF(u.display_name, ''), '長者')
             FROM app_users u
@@ -923,18 +956,44 @@ def get_elder_patient_by_line_user_id(line_user_id):
         )
         row = cursor.fetchone()
         if not row:
-            raise RuntimeError("找不到目前長者的使用者資料")
-        if row[2] not in {"elderly", "elder"}:
-            raise RuntimeError("只有長者身份可以使用此功能")
-        if not row[3]:
-            raise RuntimeError("目前尚未建立長者資料，請家屬先完成長者綁定")
+            raise RuntimeError("找不到目前使用者資料，請重新加入 Bot 並設定身份")
+
+        role_code = row[2]
+        if role_code not in {"elderly", "elder", "patient"}:
+            raise RuntimeError(
+                f"目前身份為「{role_code}」，請先在身份設定中切換為長者"
+            )
+
+        patient_id = row[3]
+        patient_name = row[4]
+
+        if not patient_id:
+            cursor.execute(
+                """
+                INSERT INTO patients (
+                    linked_user_id,
+                    full_name,
+                    notes,
+                    is_active
+                )
+                VALUES (%s,%s,'長者首次使用功能時自動建立',TRUE)
+                RETURNING id
+                """,
+                (row[0], patient_name),
+            )
+            patient_id = cursor.fetchone()[0]
+            connection.commit()
+
         return {
             "user_id": row[0],
             "display_name": row[1],
-            "role": row[2],
-            "patient_id": row[3],
-            "patient_name": row[4],
+            "role": role_code,
+            "patient_id": patient_id,
+            "patient_name": patient_name,
         }
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         connection.close()
 
@@ -1267,6 +1326,22 @@ def elder_today_taken_record_text(patient):
 
 
 def handle_elder_medication_postback(event, action, params):
+    if action not in {
+        "elder_today_breakfast",
+        "elder_today_lunch",
+        "elder_today_dinner",
+        "elder_today_bedtime",
+        "elder_today_all",
+        "elder_taken_breakfast",
+        "elder_taken_lunch",
+        "elder_taken_dinner",
+        "elder_taken_bedtime",
+        "elder_taken_today",
+        "elder_confirm_taken_meal",
+        "elder_cancel",
+    }:
+        return handle_elder_extended_postback(event, action, params)
+
     line_user_id = get_user_id(event)
     if not line_user_id:
         reply_text(event.reply_token, "無法取得您的 LINE User ID。")
@@ -1379,6 +1454,596 @@ def handle_elder_medication_postback(event, action, params):
 
     if action == "elder_cancel":
         reply_text(event.reply_token, "已取消本次操作。")
+        return True
+
+    return False
+
+
+
+# =========================================================
+# 長者：我的藥物、身體不適、行事曆、SOS
+# =========================================================
+
+def camera_quick_reply_message():
+    return TextMessage(
+        text="請選擇拍攝藥單的方式：",
+        quick_reply=QuickReply(
+            items=[
+                QuickReplyItem(
+                    action=CameraAction(label="開啟相機")
+                ),
+                QuickReplyItem(
+                    action=CameraRollAction(label="從圖庫選擇")
+                ),
+                postback_item("取消", "action=elder_cancel"),
+            ]
+        ),
+    )
+
+
+def list_elder_active_medications(patient_id):
+    return list_patient_medications(patient_id, active_only=True)
+
+
+def elder_medicine_list_text(patient):
+    medications = list_elder_active_medications(patient["patient_id"])
+    if not medications:
+        return f"{patient['patient_name']}目前沒有使用中的藥物。"
+
+    lines = [f"{patient['patient_name']}目前使用中的藥物："]
+    for index, medication in enumerate(medications, 1):
+        inv = _medication_inventory_values(medication)
+        lines.extend([
+            "",
+            f"{index}. {medication['medication_name']}",
+            f"含量：{medication.get('dosage') or '未標示'}",
+            f"用法：{medication.get('instructions') or '未標示'}",
+            f"剩餘：{_format_quantity(inv['remaining'])} {medication['quantity_unit']}",
+        ])
+    return "\n".join(lines)
+
+
+def save_elder_discomfort(patient, reported_by, symptom, description=None):
+    severity_map = {
+        "頭暈": "moderate",
+        "頭痛": "moderate",
+        "想吐": "moderate",
+        "睡不好": "mild",
+        "其他問題": "normal",
+    }
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO abnormal_reports (
+                patient_id, reported_by, report_type, severity,
+                description, occurred_at, is_active
+            )
+            VALUES (%s,%s,%s,%s,%s,CURRENT_TIMESTAMP,TRUE)
+            """,
+            (
+                patient["patient_id"],
+                reported_by,
+                symptom,
+                severity_map.get(symptom, "normal"),
+                description or symptom,
+            ),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def list_elder_contacts(patient_id):
+    """
+    優先讀取 emergency_contacts。
+    若家屬端尚未建立專用緊急聯絡人，就以同家庭家屬成員作為備援。
+    """
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                contact_name,
+                relationship,
+                phone_number,
+                line_user_id,
+                priority_order
+            FROM emergency_contacts
+            WHERE patient_id=%s AND is_active=TRUE
+            ORDER BY priority_order, created_at
+            """,
+            (patient_id,),
+        )
+        rows = cursor.fetchall()
+        contacts = [{
+            "name": r[0],
+            "relationship": r[1] or "家屬",
+            "phone": r[2],
+            "line_user_id": r[3],
+            "priority": r[4],
+        } for r in rows]
+
+        if contacts:
+            return contacts
+
+        cursor.execute(
+            """
+            SELECT DISTINCT
+                COALESCE(NULLIF(fu.display_name,''),'家屬'),
+                fu.line_user_id
+            FROM patients p
+            JOIN family_members elder_member
+              ON elder_member.user_id = p.linked_user_id
+             AND elder_member.member_role = 'elderly'
+             AND elder_member.is_active = TRUE
+            JOIN family_members family_member
+              ON family_member.family_id = elder_member.family_id
+             AND family_member.member_role = 'family'
+             AND family_member.is_active = TRUE
+            JOIN app_users fu
+              ON fu.id = family_member.user_id
+             AND fu.is_active = TRUE
+            WHERE p.id=%s
+            ORDER BY 1
+            """,
+            (patient_id,),
+        )
+        return [{
+            "name": r[0],
+            "relationship": "家屬",
+            "phone": None,
+            "line_user_id": r[1],
+            "priority": index,
+        } for index, r in enumerate(cursor.fetchall(), 1)]
+    finally:
+        connection.close()
+
+
+def notify_elder_family(patient, message):
+    contacts = list_elder_contacts(patient["patient_id"])
+    line_ids = [c["line_user_id"] for c in contacts if c.get("line_user_id")]
+
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT DISTINCT flg.line_group_id
+            FROM patients p
+            JOIN family_members em
+              ON em.user_id=p.linked_user_id
+             AND em.member_role='elderly'
+             AND em.is_active=TRUE
+            JOIN family_line_groups flg
+              ON flg.family_id=em.family_id
+             AND flg.is_active=TRUE
+            WHERE p.id=%s
+            """,
+            (patient["patient_id"],),
+        )
+        line_ids.extend(row[0] for row in cursor.fetchall() if row[0])
+    finally:
+        connection.close()
+
+    sent = 0
+    failed = 0
+    for target_id in dict.fromkeys(line_ids):
+        api_client, messaging_api = get_messaging_api()
+        try:
+            messaging_api.push_message(
+                PushMessageRequest(
+                    to=target_id,
+                    messages=[TextMessage(text=safe_text(message))],
+                )
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+            app.logger.error(traceback.format_exc())
+        finally:
+            api_client.close()
+    return sent, failed
+
+
+def elder_calendar_text(patient):
+    events = list_patient_calendar_events(
+        patient["patient_id"],
+        upcoming_only=False,
+        limit=30,
+    )
+    return calendar_event_text(
+        {
+            "display_name": patient["patient_name"],
+            "patient_id": patient["patient_id"],
+        },
+        events,
+    )
+
+
+def handle_elder_extended_postback(event, action, params):
+    line_user_id = get_user_id(event)
+    patient = get_elder_patient_by_line_user_id(line_user_id)
+
+    if action == "elder_medicine_list":
+        reply_text(event.reply_token, elder_medicine_list_text(patient))
+        return True
+
+    if action == "elder_medicine_info":
+        medications = list_elder_active_medications(patient["patient_id"])
+        if not medications:
+            reply_text(event.reply_token, "目前沒有可查看說明的藥物。")
+            return True
+        items = [
+            postback_item(
+                medication["medication_name"][:20],
+                f"action=elder_medicine_select&mode=info&medication_id={medication['id']}",
+            )
+            for medication in medications[:12]
+        ]
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message("請選擇要查看說明的藥物：", items),
+        )
+        return True
+
+    if action == "elder_medicine_remaining":
+        medications = list_elder_active_medications(patient["patient_id"])
+        reply_text(
+            event.reply_token,
+            remaining_summary_text(
+                {
+                    "display_name": patient["patient_name"],
+                    "patient_id": patient["patient_id"],
+                },
+                medications,
+                low_only=False,
+            ),
+        )
+        return True
+
+    if action == "elder_medicine_capture":
+        set_operation_state(
+            line_user_id,
+            action,
+            "waiting_elder_prescription_image",
+            {"patient_id": str(patient["patient_id"])},
+        )
+        reply_message(event.reply_token, camera_quick_reply_message())
+        return True
+
+    if action == "elder_medicine_stop":
+        medications = list_elder_active_medications(patient["patient_id"])
+        if not medications:
+            reply_text(event.reply_token, "目前沒有可停用的藥物。")
+            return True
+        items = [
+            postback_item(
+                medication["medication_name"][:20],
+                f"action=elder_medicine_select&mode=stop&medication_id={medication['id']}",
+            )
+            for medication in medications[:12]
+        ]
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                "請選擇要提出停用的藥物。停藥前仍應先詢問醫師：",
+                items,
+            ),
+        )
+        return True
+
+    if action == "elder_medicine_select":
+        medication_id = params.get("medication_id", [None])[0]
+        mode = params.get("mode", [None])[0]
+        medication = get_patient_medication(patient["patient_id"], medication_id)
+        if not medication:
+            raise RuntimeError("找不到這筆藥物資料")
+
+        if mode == "info":
+            inv = _medication_inventory_values(medication)
+            reply_text(
+                event.reply_token,
+                (
+                    f"藥物：{medication['medication_name']}\n"
+                    f"學名：{medication.get('generic_name') or '未標示'}\n"
+                    f"含量：{medication.get('dosage') or '未標示'}\n"
+                    f"用法：{medication.get('instructions') or '未標示'}\n"
+                    f"目前剩餘：{_format_quantity(inv['remaining'])} "
+                    f"{medication['quantity_unit']}"
+                ),
+            )
+            return True
+
+        if mode == "stop":
+            set_operation_state(
+                line_user_id,
+                "elder_medicine_stop",
+                "confirm_stop",
+                {
+                    "patient_id": str(patient["patient_id"]),
+                    "medication_id": str(medication["id"]),
+                    "medication_name": medication["medication_name"],
+                },
+            )
+            reply_message(
+                event.reply_token,
+                make_quick_reply_message(
+                    (
+                        f"確定將「{medication['medication_name']}」標記為停用？\n"
+                        "請確認這是醫師指示，不要自行停藥。"
+                    ),
+                    [
+                        postback_item(
+                            "確認停用",
+                            "action=elder_medicine_confirm_stop",
+                        ),
+                        postback_item("取消", "action=elder_cancel"),
+                    ],
+                ),
+            )
+            return True
+
+    if action == "elder_medicine_confirm_stop":
+        state = get_operation_state(line_user_id)
+        payload = state.get("payload", {}) if state else {}
+        medication_id = payload.get("medication_id")
+        if not medication_id:
+            raise RuntimeError("停用資料已逾時")
+        connection = get_db_connection()
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                UPDATE medications
+                SET is_active=FALSE, end_date=COALESCE(end_date,CURRENT_DATE),
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=%s AND patient_id=%s
+                """,
+                (medication_id, patient["patient_id"]),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        clear_operation_state(line_user_id)
+        reply_text(
+            event.reply_token,
+            f"已將「{payload.get('medication_name','該藥物')}」標記為停用。",
+        )
+        return True
+
+    symptom_actions = {
+        "elder_discomfort_dizziness": "頭暈",
+        "elder_discomfort_headache": "頭痛",
+        "elder_discomfort_nausea": "想吐",
+        "elder_discomfort_sleep": "睡不好",
+    }
+    if action in symptom_actions:
+        symptom = symptom_actions[action]
+        save_elder_discomfort(
+            patient,
+            patient["user_id"],
+            symptom,
+            symptom,
+        )
+        reply_text(
+            event.reply_token,
+            f"已記錄不舒服狀況：{symptom}\n家屬端可在「異常統計」中查看。",
+        )
+        return True
+
+    if action == "elder_discomfort_other":
+        set_operation_state(
+            line_user_id,
+            action,
+            "waiting_elder_discomfort_text",
+            {"patient_id": str(patient["patient_id"])},
+        )
+        reply_text(
+            event.reply_token,
+            "請描述目前不舒服的情況，例如：胸悶、皮膚癢。\n輸入「取消」可結束。",
+        )
+        return True
+
+    if action == "elder_calendar_view":
+        reply_text(event.reply_token, elder_calendar_text(patient))
+        return True
+
+    if action == "elder_calendar_add":
+        set_operation_state(
+            line_user_id,
+            action,
+            "waiting_elder_calendar_title",
+            {"patient_id": str(patient["patient_id"]), "patient_name": patient["patient_name"]},
+        )
+        reply_text(event.reply_token, "請輸入行程名稱，例如：回診、領藥。")
+        return True
+
+    if action in {"elder_calendar_edit", "elder_calendar_delete"}:
+        events = list_patient_calendar_events(patient["patient_id"], upcoming_only=False)
+        if not events:
+            reply_text(event.reply_token, "目前沒有可操作的行程。")
+            return True
+        mode = "edit" if action == "elder_calendar_edit" else "delete"
+        items = [
+            postback_item(
+                f"{item['starts_at'].strftime('%m/%d')} {item['title']}"[:20],
+                f"action=elder_calendar_select_event&mode={mode}&event_id={item['id']}",
+            )
+            for item in events[:12]
+        ]
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                "請選擇行程：",
+                items,
+            ),
+        )
+        return True
+
+    if action == "elder_calendar_select_event":
+        event_id = params.get("event_id", [None])[0]
+        mode = params.get("mode", [None])[0]
+        calendar_item = get_patient_calendar_event(patient["patient_id"], event_id)
+        if not calendar_item:
+            raise RuntimeError("找不到行程")
+
+        if mode == "delete":
+            set_operation_state(
+                line_user_id,
+                "elder_calendar_delete",
+                "confirm_elder_calendar_delete",
+                {"event_id": str(event_id), "event_title": calendar_item["title"]},
+            )
+            reply_message(
+                event.reply_token,
+                make_quick_reply_message(
+                    f"確定刪除「{calendar_item['title']}」？",
+                    [
+                        postback_item(
+                            "確認刪除",
+                            "action=elder_calendar_confirm_delete",
+                        ),
+                        postback_item("取消", "action=elder_cancel"),
+                    ],
+                ),
+            )
+            return True
+
+        set_operation_state(
+            line_user_id,
+            "elder_calendar_edit",
+            "waiting_elder_calendar_datetime",
+            {"event_id": str(event_id), "event_title": calendar_item["title"]},
+        )
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                "請選擇新的日期與時間：",
+                [
+                    datetime_item(
+                        "選擇日期時間",
+                        "action=elder_calendar_save_datetime&mode=edit",
+                        mode="datetime",
+                        minimum=taipei_now().strftime("%Y-%m-%dT%H:%M"),
+                    ),
+                    postback_item("取消", "action=elder_cancel"),
+                ],
+            ),
+        )
+        return True
+
+    if action == "elder_calendar_save_datetime":
+        state = get_operation_state(line_user_id)
+        payload = state.get("payload", {}) if state else {}
+        dt_value = getattr(getattr(event.postback, "params", None), "datetime", None)
+        if not dt_value:
+            raise RuntimeError("沒有取得日期時間")
+        selected_dt = datetime.fromisoformat(dt_value).replace(tzinfo=TAIPEI_TZ)
+        mode = params.get("mode", [None])[0]
+
+        if mode == "add":
+            create_patient_calendar_event(
+                patient["patient_id"],
+                payload["calendar_title"],
+                payload.get("calendar_description"),
+                payload.get("calendar_location"),
+                selected_dt,
+                patient["user_id"],
+            )
+            clear_operation_state(line_user_id)
+            reply_text(event.reply_token, "行程新增完成。")
+            return True
+
+        update_patient_calendar_event(
+            payload["event_id"],
+            patient["patient_id"],
+            "starts_at",
+            selected_dt,
+        )
+        clear_operation_state(line_user_id)
+        reply_text(event.reply_token, "行程日期時間修改完成。")
+        return True
+
+    if action == "elder_calendar_confirm_delete":
+        state = get_operation_state(line_user_id)
+        payload = state.get("payload", {}) if state else {}
+        delete_patient_calendar_event(
+            payload["event_id"],
+            patient["patient_id"],
+        )
+        clear_operation_state(line_user_id)
+        reply_text(
+            event.reply_token,
+            f"已刪除行程：{payload.get('event_title','未命名行程')}",
+        )
+        return True
+
+    if action == "elder_calendar_reminder":
+        reply_text(
+            event.reply_token,
+            "回診提醒由家屬端設定；您可以在行事曆中查看已安排的回診日期。",
+        )
+        return True
+
+    if action in {"elder_sos_contact1", "elder_sos_contact2"}:
+        index = 0 if action.endswith("contact1") else 1
+        contacts = list_elder_contacts(patient["patient_id"])
+        if len(contacts) <= index:
+            reply_text(event.reply_token, f"目前尚未設定緊急聯絡人 {index + 1}。")
+            return True
+        contact = contacts[index]
+        items = []
+        if contact.get("phone"):
+            items.append(
+                QuickReplyItem(
+                    action=URIAction(
+                        label="立即撥打",
+                        uri=f"tel:{contact['phone']}",
+                    )
+                )
+            )
+        if contact.get("line_user_id"):
+            items.append(
+                postback_item(
+                    "傳送緊急通知",
+                    "action=elder_sos_notify_all",
+                )
+            )
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                (
+                    f"緊急聯絡人 {index + 1}\n"
+                    f"姓名：{contact['name']}\n"
+                    f"關係：{contact['relationship']}\n"
+                    f"電話：{contact.get('phone') or '未設定'}"
+                ),
+                items or [postback_item("返回", "action=elder_cancel")],
+            ),
+        )
+        return True
+
+    if action == "elder_sos_notify_all":
+        message = (
+            f"【長者緊急通知】\n"
+            f"{patient['patient_name']}按下了緊急通知。\n"
+            f"時間：{taipei_now().strftime('%Y-%m-%d %H:%M')}\n"
+            "請儘快確認長者狀況。"
+        )
+        sent, failed = notify_elder_family(patient, message)
+        reply_text(
+            event.reply_token,
+            f"緊急通知已送出。\n成功：{sent} 位／群組\n失敗：{failed}",
+        )
         return True
 
     return False
@@ -3562,6 +4227,73 @@ def handle_text_message(event):
             )
             return
 
+
+        if user_id:
+            elder_state = get_operation_state(user_id)
+            if elder_state:
+                if user_text in {"取消", "cancel", "Cancel"}:
+                    clear_operation_state(user_id)
+                    reply_text(event.reply_token, "已取消本次操作。")
+                    return
+
+                step = elder_state.get("step")
+                payload = elder_state.get("payload", {})
+
+                if step == "waiting_elder_discomfort_text":
+                    patient = get_elder_patient_by_line_user_id(user_id)
+                    save_elder_discomfort(
+                        patient,
+                        patient["user_id"],
+                        "其他問題",
+                        user_text,
+                    )
+                    clear_operation_state(user_id)
+                    reply_text(
+                        event.reply_token,
+                        "已記錄目前不舒服的情況，家屬端可在異常統計中查看。",
+                    )
+                    return
+
+                if step == "waiting_elder_calendar_title":
+                    payload["calendar_title"] = user_text[:255]
+                    set_operation_state(
+                        user_id,
+                        "elder_calendar_add",
+                        "waiting_elder_calendar_location",
+                        payload,
+                    )
+                    reply_text(
+                        event.reply_token,
+                        "請輸入地點，例如：埔里基督教醫院。沒有地點請輸入「未填寫」。",
+                    )
+                    return
+
+                if step == "waiting_elder_calendar_location":
+                    payload["calendar_location"] = (
+                        None if user_text in {"未填寫", "無", "沒有"} else user_text[:500]
+                    )
+                    set_operation_state(
+                        user_id,
+                        "elder_calendar_add",
+                        "waiting_elder_calendar_datetime",
+                        payload,
+                    )
+                    reply_message(
+                        event.reply_token,
+                        make_quick_reply_message(
+                            "請選擇日期與時間：",
+                            [
+                                datetime_item(
+                                    "選擇日期時間",
+                                    "action=elder_calendar_save_datetime&mode=add",
+                                    mode="datetime",
+                                    minimum=taipei_now().strftime("%Y-%m-%dT%H:%M"),
+                                ),
+                                postback_item("取消", "action=elder_cancel"),
+                            ],
+                        ),
+                    )
+                    return
         answer = gpt_response(
             user_text
         )
@@ -3619,9 +4351,49 @@ def handle_image_message(event):
         finally:
             api_client.close()
 
+
+        state = get_operation_state(user_id) if user_id else None
+        if state and state.get("step") == "waiting_elder_prescription_image":
+            patient = get_elder_patient_by_line_user_id(user_id)
+            connection = get_db_connection()
+            try:
+                cursor = connection.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO ai_medication_scans (
+                        patient_id,
+                        uploaded_by,
+                        line_message_id,
+                        image_path,
+                        processing_status,
+                        created_at
+                    )
+                    VALUES (%s,%s,%s,%s,'uploaded',CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        patient["patient_id"],
+                        patient["user_id"],
+                        event.message.id,
+                        image_path,
+                    ),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+            clear_operation_state(user_id)
+            reply_text(
+                event.reply_token,
+                "藥單圖片已上傳並保存，家屬可在「藥袋紀錄」中查看。",
+            )
+            return
+
         reply_text(
             event.reply_token,
-            "已收到藥袋圖片，接下來會進行 AI 辨識。",
+            "已收到圖片。",
         )
 
     except Exception:
