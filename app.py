@@ -6,6 +6,7 @@ import math
 import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
 from urllib.parse import parse_qs
 
 import requests
@@ -844,6 +845,543 @@ def bind_role_rich_menu(user_id, role):
         raise
 
 
+
+
+
+ELDER_MEDICATION_ACTIONS = {
+    "elder_today_breakfast",
+    "elder_today_lunch",
+    "elder_today_dinner",
+    "elder_today_bedtime",
+    "elder_today_all",
+    "elder_taken_breakfast",
+    "elder_taken_lunch",
+    "elder_taken_dinner",
+    "elder_taken_bedtime",
+    "elder_taken_today",
+    "elder_confirm_taken_meal",
+    "elder_cancel",
+}
+
+
+
+# =========================================================
+# 長者：今日用藥與我已服藥
+# =========================================================
+
+TAIPEI_TZ = ZoneInfo("Asia/Taipei")
+
+ELDER_MEAL_LABELS = {
+    "breakfast": "早餐藥物",
+    "lunch": "午餐藥物",
+    "dinner": "晚餐藥物",
+    "bedtime": "睡前藥物",
+}
+
+ELDER_TODAY_ACTION_MEALS = {
+    "elder_today_breakfast": "breakfast",
+    "elder_today_lunch": "lunch",
+    "elder_today_dinner": "dinner",
+    "elder_today_bedtime": "bedtime",
+}
+
+ELDER_TAKEN_ACTION_MEALS = {
+    "elder_taken_breakfast": "breakfast",
+    "elder_taken_lunch": "lunch",
+    "elder_taken_dinner": "dinner",
+    "elder_taken_bedtime": "bedtime",
+}
+
+
+def taipei_now():
+    return datetime.now(TAIPEI_TZ)
+
+
+def get_elder_patient_by_line_user_id(line_user_id):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                u.id,
+                COALESCE(NULLIF(u.display_name, ''), '長者'),
+                r.code,
+                p.id,
+                COALESCE(NULLIF(p.full_name, ''), NULLIF(u.display_name, ''), '長者')
+            FROM app_users u
+            JOIN roles r ON r.id = u.role_id
+            LEFT JOIN patients p
+              ON p.linked_user_id = u.id
+             AND p.is_active = TRUE
+            WHERE u.line_user_id = %s
+              AND u.is_active = TRUE
+            ORDER BY p.updated_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            (line_user_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise RuntimeError("找不到目前長者的使用者資料")
+        if row[2] not in {"elderly", "elder"}:
+            raise RuntimeError("只有長者身份可以使用此功能")
+        if not row[3]:
+            raise RuntimeError("目前尚未建立長者資料，請家屬先完成長者綁定")
+        return {
+            "user_id": row[0],
+            "display_name": row[1],
+            "role": row[2],
+            "patient_id": row[3],
+            "patient_name": row[4],
+        }
+    finally:
+        connection.close()
+
+
+def normalize_meal_slot(meal_slot, schedule_time=None):
+    if meal_slot in ELDER_MEAL_LABELS:
+        return meal_slot
+
+    if schedule_time is None:
+        return None
+
+    hour = schedule_time.hour
+    if 4 <= hour < 11:
+        return "breakfast"
+    if 11 <= hour < 16:
+        return "lunch"
+    if 16 <= hour < 21:
+        return "dinner"
+    return "bedtime"
+
+
+def list_elder_today_medications(patient_id, meal_slot=None):
+    """
+    取得今天有效的用藥排程。
+    meal_slot 優先使用資料庫欄位；舊資料沒有 meal_slot 時，以 schedule_time 推算。
+    """
+    today = taipei_now().date()
+    weekday = today.isoweekday()
+
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                ms.id,
+                ms.medication_id,
+                ms.schedule_time,
+                ms.dose_amount,
+                ms.before_or_after_meal,
+                ms.meal_slot,
+                m.medication_name,
+                m.generic_name,
+                m.dosage,
+                m.dosage_form,
+                m.instructions,
+                ml.id,
+                ml.status::text,
+                ml.taken_at,
+                ml.note
+            FROM medication_schedules ms
+            JOIN medications m
+              ON m.id = ms.medication_id
+            LEFT JOIN medication_logs ml
+              ON ml.schedule_id = ms.id
+             AND ml.patient_id = m.patient_id
+             AND (ml.scheduled_at AT TIME ZONE 'Asia/Taipei')::date = %s
+            WHERE m.patient_id = %s
+              AND m.is_active = TRUE
+              AND ms.is_active = TRUE
+              AND (ms.starts_on IS NULL OR ms.starts_on <= %s)
+              AND (ms.ends_on IS NULL OR ms.ends_on >= %s)
+              AND %s = ANY(ms.weekdays)
+            ORDER BY ms.schedule_time, m.medication_name
+            """,
+            (today, patient_id, today, today, weekday),
+        )
+        result = []
+        for row in cursor.fetchall():
+            slot = normalize_meal_slot(row[5], row[2])
+            if meal_slot and slot != meal_slot:
+                continue
+            result.append({
+                "schedule_id": row[0],
+                "medication_id": row[1],
+                "schedule_time": row[2],
+                "dose_amount": row[3],
+                "meal_relation": row[4],
+                "meal_slot": slot,
+                "medication_name": row[6] or "未命名藥物",
+                "generic_name": row[7],
+                "dosage": row[8],
+                "dosage_form": row[9],
+                "instructions": row[10],
+                "log_id": row[11],
+                "status": row[12],
+                "taken_at": row[13],
+                "log_note": row[14],
+            })
+        return result
+    finally:
+        connection.close()
+
+
+def medication_status_text(status):
+    return {
+        None: "尚未回報",
+        "scheduled": "尚未回報",
+        "taken": "已服藥",
+        "missed": "漏服",
+        "skipped": "略過",
+        "late": "延遲服藥",
+    }.get(status, status or "尚未回報")
+
+
+def elder_medication_list_text(patient, meal_slot=None):
+    medications = list_elder_today_medications(
+        patient["patient_id"],
+        meal_slot=meal_slot,
+    )
+    title = (
+        ELDER_MEAL_LABELS[meal_slot]
+        if meal_slot
+        else "今日全部藥物"
+    )
+
+    if not medications:
+        return f"{patient['patient_name']}的{title}：\n目前沒有需要使用的藥物。"
+
+    grouped = {}
+    for medication in medications:
+        slot = medication["meal_slot"] or "other"
+        grouped.setdefault(slot, []).append(medication)
+
+    lines = [
+        f"{patient['patient_name']}的{title}：",
+        f"日期：{taipei_now().strftime('%Y-%m-%d')}",
+    ]
+
+    display_order = ["breakfast", "lunch", "dinner", "bedtime", "other"]
+    for slot in display_order:
+        items = grouped.get(slot, [])
+        if not items:
+            continue
+        lines.extend([
+            "",
+            f"【{ELDER_MEAL_LABELS.get(slot, '其他時段')}】",
+        ])
+        for index, item in enumerate(items, 1):
+            time_text = (
+                item["schedule_time"].strftime("%H:%M")
+                if item["schedule_time"]
+                else "未設定"
+            )
+            dose_text = item["dose_amount"] or item["dosage"] or "未標示"
+            lines.extend([
+                f"{index}. {item['medication_name']}",
+                f"   時間：{time_text}",
+                f"   每次量：{dose_text}",
+                f"   飯前／飯後：{item['meal_relation'] or '未標示'}",
+                f"   狀態：{medication_status_text(item['status'])}",
+            ])
+            if item.get("instructions"):
+                lines.append(f"   用法：{item['instructions']}")
+
+    return "\n".join(lines)
+
+
+def ensure_today_scheduled_log(patient_id, medication):
+    now = taipei_now()
+    scheduled_local = datetime.combine(
+        now.date(),
+        medication["schedule_time"],
+        tzinfo=TAIPEI_TZ,
+    )
+
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO medication_logs (
+                schedule_id,
+                medication_id,
+                patient_id,
+                scheduled_at,
+                status,
+                created_at,
+                updated_at
+            )
+            VALUES (%s,%s,%s,%s,'scheduled',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+            ON CONFLICT (schedule_id, patient_id, scheduled_local_date)
+            DO UPDATE SET
+                medication_id = EXCLUDED.medication_id,
+                scheduled_at = EXCLUDED.scheduled_at,
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING id, status::text
+            """,
+            (
+                medication["schedule_id"],
+                medication["medication_id"],
+                patient_id,
+                scheduled_local,
+            ),
+        )
+        row = cursor.fetchone()
+        connection.commit()
+        return row[0], row[1]
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def mark_elder_meal_taken(patient, meal_slot, reported_by):
+    medications = list_elder_today_medications(
+        patient["patient_id"],
+        meal_slot=meal_slot,
+    )
+    if not medications:
+        raise RuntimeError(
+            f"今天沒有設定{ELDER_MEAL_LABELS[meal_slot]}，無法建立服藥紀錄"
+        )
+
+    now = taipei_now()
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        updated = []
+        already_taken = []
+
+        for medication in medications:
+            scheduled_local = datetime.combine(
+                now.date(),
+                medication["schedule_time"],
+                tzinfo=TAIPEI_TZ,
+            )
+            cursor.execute(
+                """
+                INSERT INTO medication_logs (
+                    schedule_id,
+                    medication_id,
+                    patient_id,
+                    scheduled_at,
+                    taken_at,
+                    status,
+                    reported_by,
+                    note,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    %s,%s,%s,%s,%s,'taken',%s,%s,
+                    CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+                )
+                ON CONFLICT (schedule_id, patient_id, scheduled_local_date)
+                DO UPDATE SET
+                    taken_at = CASE
+                        WHEN medication_logs.status = 'taken'
+                            THEN medication_logs.taken_at
+                        ELSE EXCLUDED.taken_at
+                    END,
+                    status = 'taken',
+                    reported_by = EXCLUDED.reported_by,
+                    note = EXCLUDED.note,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING status::text, taken_at
+                """,
+                (
+                    medication["schedule_id"],
+                    medication["medication_id"],
+                    patient["patient_id"],
+                    scheduled_local,
+                    now,
+                    reported_by,
+                    f"長者確認已服用{ELDER_MEAL_LABELS[meal_slot]}",
+                ),
+            )
+            result = cursor.fetchone()
+            if medication.get("status") == "taken":
+                already_taken.append(medication["medication_name"])
+            else:
+                updated.append(medication["medication_name"])
+
+        connection.commit()
+        return {
+            "updated": updated,
+            "already_taken": already_taken,
+            "taken_at": now,
+        }
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def elder_today_taken_record_text(patient):
+    medications = list_elder_today_medications(patient["patient_id"])
+    if not medications:
+        return (
+            f"{patient['patient_name']}的今日服藥紀錄：\n"
+            "今天沒有用藥排程。"
+        )
+
+    lines = [
+        f"{patient['patient_name']}的今日服藥紀錄：",
+        f"日期：{taipei_now().strftime('%Y-%m-%d')}",
+    ]
+
+    grouped = {}
+    for item in medications:
+        grouped.setdefault(item["meal_slot"] or "other", []).append(item)
+
+    for slot in ["breakfast", "lunch", "dinner", "bedtime", "other"]:
+        items = grouped.get(slot, [])
+        if not items:
+            continue
+        taken_count = sum(1 for item in items if item["status"] == "taken")
+        lines.extend([
+            "",
+            (
+                f"【{ELDER_MEAL_LABELS.get(slot, '其他時段')}】"
+                f" {taken_count}/{len(items)} 已服"
+            ),
+        ])
+        for item in items:
+            taken_time = (
+                item["taken_at"].astimezone(TAIPEI_TZ).strftime("%H:%M")
+                if item.get("taken_at")
+                else None
+            )
+            status = medication_status_text(item.get("status"))
+            if taken_time:
+                status += f"（{taken_time}）"
+            lines.append(f"・{item['medication_name']}：{status}")
+
+    return "\n".join(lines)
+
+
+def handle_elder_medication_postback(event, action, params):
+    line_user_id = get_user_id(event)
+    if not line_user_id:
+        reply_text(event.reply_token, "無法取得您的 LINE User ID。")
+        return True
+
+    patient = get_elder_patient_by_line_user_id(line_user_id)
+
+    if action in ELDER_TODAY_ACTION_MEALS:
+        meal_slot = ELDER_TODAY_ACTION_MEALS[action]
+        reply_text(
+            event.reply_token,
+            elder_medication_list_text(patient, meal_slot),
+        )
+        return True
+
+    if action == "elder_today_all":
+        reply_text(
+            event.reply_token,
+            elder_medication_list_text(patient, meal_slot=None),
+        )
+        return True
+
+    if action in ELDER_TAKEN_ACTION_MEALS:
+        meal_slot = ELDER_TAKEN_ACTION_MEALS[action]
+        medications = list_elder_today_medications(
+            patient["patient_id"],
+            meal_slot=meal_slot,
+        )
+        if not medications:
+            reply_text(
+                event.reply_token,
+                f"今天沒有設定{ELDER_MEAL_LABELS[meal_slot]}。",
+            )
+            return True
+
+        not_taken = [
+            item for item in medications
+            if item.get("status") != "taken"
+        ]
+        if not not_taken:
+            reply_text(
+                event.reply_token,
+                (
+                    f"{ELDER_MEAL_LABELS[meal_slot]}已經完成回報。\n\n"
+                    + elder_today_taken_record_text(patient)
+                ),
+            )
+            return True
+
+        medication_names = "\n".join(
+            f"・{item['medication_name']}（{item['dose_amount'] or item['dosage'] or '未標示'}）"
+            for item in medications
+        )
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                (
+                    f"確認已吃完{ELDER_MEAL_LABELS[meal_slot]}的所有藥物？\n\n"
+                    f"{medication_names}"
+                ),
+                [
+                    postback_item(
+                        "確認已服藥",
+                        (
+                            "action=elder_confirm_taken_meal"
+                            f"&meal_slot={meal_slot}"
+                        ),
+                    ),
+                    postback_item("取消", "action=elder_cancel"),
+                ],
+            ),
+        )
+        return True
+
+    if action == "elder_confirm_taken_meal":
+        meal_slot = params.get("meal_slot", [None])[0]
+        if meal_slot not in ELDER_MEAL_LABELS:
+            raise RuntimeError("服藥時段資料不正確")
+
+        result = mark_elder_meal_taken(
+            patient,
+            meal_slot,
+            patient["user_id"],
+        )
+        lines = [
+            f"{ELDER_MEAL_LABELS[meal_slot]}服藥紀錄已完成。",
+            f"紀錄時間：{result['taken_at'].strftime('%Y-%m-%d %H:%M')}",
+        ]
+        if result["updated"]:
+            lines.extend([
+                "",
+                "本次已記錄：",
+                *[f"・{name}" for name in result["updated"]],
+            ])
+        if result["already_taken"]:
+            lines.extend([
+                "",
+                "先前已記錄：",
+                *[f"・{name}" for name in result["already_taken"]],
+            ])
+        reply_text(event.reply_token, "\n".join(lines))
+        return True
+
+    if action == "elder_taken_today":
+        reply_text(
+            event.reply_token,
+            elder_today_taken_record_text(patient),
+        )
+        return True
+
+    if action == "elder_cancel":
+        reply_text(event.reply_token, "已取消本次操作。")
+        return True
+
+    return False
 
 # =========================================================
 # 家庭管理功能
@@ -3118,6 +3656,10 @@ def handle_postback(event):
             "role",
             [None],
         )[0]
+
+        if action in ELDER_MEDICATION_ACTIONS:
+            if handle_elder_medication_postback(event, action, params):
+                return
 
         if action in FAMILY_ACTIONS:
             if handle_family_postback(event, action, params):
