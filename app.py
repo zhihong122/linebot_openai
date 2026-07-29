@@ -2092,6 +2092,15 @@ FAMILY_ACTIONS = {
     "family_report_abnormal",
     "family_report_summary",
     "family_report_select_patient",
+    "family_monitor_today_status",
+    "family_monitor_missed",
+    "family_monitor_emergency",
+    "family_monitor_discomfort",
+    "family_monitor_adherence",
+    "family_monitor_select_patient",
+    "family_monitor_adherence_7",
+    "family_monitor_adherence_30",
+    "family_monitor_contact_select",
     "family_cancel",
 }
 
@@ -2450,10 +2459,78 @@ def handle_family_text_input(event, user_text, user_id):
         reply_text(event.reply_token,f"行程地點已修改為：{new_location or '未填寫'}")
         return True
 
+
+    if state["step"] == "waiting_monitor_contact_name":
+        payload = state.get("payload", {})
+        payload["contact_name"] = user_text[:255]
+        set_operation_state(
+            user_id,"family_monitor_emergency",
+            "waiting_monitor_contact_relationship",payload
+        )
+        reply_text(
+            event.reply_token,
+            "請輸入與長者的關係，例如：女兒、兒子、配偶。"
+        )
+        return True
+
+    if state["step"] == "waiting_monitor_contact_relationship":
+        payload = state.get("payload", {})
+        payload["relationship"] = user_text[:100]
+        set_operation_state(
+            user_id,"family_monitor_emergency",
+            "waiting_monitor_contact_phone",payload
+        )
+        reply_text(event.reply_token,"請輸入聯絡電話，例如：0912345678。")
+        return True
+
+    if state["step"] == "waiting_monitor_contact_phone":
+        payload = state.get("payload", {})
+        phone = re.sub(r"[^0-9+]", "", user_text)
+        if len(phone) < 8:
+            raise RuntimeError("電話格式不正確，請重新輸入")
+        payload["phone_number"] = phone
+        set_operation_state(
+            user_id,"family_monitor_emergency",
+            "waiting_monitor_contact_line",payload
+        )
+        reply_text(
+            event.reply_token,
+            "請輸入此聯絡人的 LINE User ID；若沒有請輸入「略過」。"
+        )
+        return True
+
+    if state["step"] == "waiting_monitor_contact_line":
+        payload = state.get("payload", {})
+        line_user_id = None if user_text in {"略過","無","沒有"} else user_text
+        upsert_family_emergency_contact(
+            payload["patient_id"],
+            payload["priority"],
+            payload["contact_name"],
+            payload["relationship"],
+            payload["phone_number"],
+            line_user_id,
+        )
+        clear_operation_state(user_id)
+        reply_text(
+            event.reply_token,
+            (
+                "緊急聯絡人設定完成！\n"
+                f"長者：{payload['patient_name']}\n"
+                f"順位：{payload['priority']}\n"
+                f"姓名：{payload['contact_name']}\n"
+                f"關係：{payload['relationship']}\n"
+                f"電話：{payload['phone_number']}"
+            ),
+        )
+        return True
+
     return False
 
 
 def handle_family_postback(event, action, params):
+    if action.startswith("family_monitor_"):
+        return handle_family_monitor_postback(event, action, params)
+
     if action.startswith("family_report_"):
         return handle_family_report_postback(event, action, params)
 
@@ -3625,6 +3702,345 @@ def handle_family_calendar_postback(event,action,params):
     return False
 
 
+
+
+# =========================================================
+# 家屬監控中心
+# =========================================================
+
+MONITOR_ACTIONS = {
+    "family_monitor_today_status": "今日狀態",
+    "family_monitor_missed": "漏服通知",
+    "family_monitor_emergency": "緊急通知",
+    "family_monitor_discomfort": "不舒服紀錄",
+    "family_monitor_adherence": "服藥率統計",
+}
+
+
+def get_patient_today_status(patient_id):
+    today = taipei_now().date()
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT ml.scheduled_at,ml.taken_at,ml.status::text,
+                   COALESCE(m.medication_name,'未命名藥物'),ml.note
+            FROM medication_logs ml
+            JOIN medications m ON m.id=ml.medication_id
+            WHERE ml.patient_id=%s
+              AND (ml.scheduled_at AT TIME ZONE 'Asia/Taipei')::date=%s
+            ORDER BY ml.scheduled_at
+            """,
+            (patient_id,today),
+        )
+        return [{
+            "scheduled_at":r[0],"taken_at":r[1],"status":r[2],
+            "medication_name":r[3],"note":r[4],
+        } for r in cursor.fetchall()]
+    finally:
+        connection.close()
+
+
+def family_today_status_text(patient):
+    rows = get_patient_today_status(patient["patient_id"])
+    if not rows:
+        return f"{patient['display_name']}今天尚無服藥紀錄。"
+    status_map = {
+        "scheduled":"待確認","taken":"已服藥","missed":"漏服",
+        "skipped":"略過","late":"延遲",
+    }
+    counts = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"],0) + 1
+    lines = [
+        f"{patient['display_name']}今日服藥狀態：",
+        "",
+        "統計：" + "、".join(
+            f"{status_map.get(k,k)} {v} 筆" for k,v in counts.items()
+        ),
+        "",
+        "明細：",
+    ]
+    for index,row in enumerate(rows,1):
+        scheduled = row["scheduled_at"].astimezone(TAIPEI_TZ).strftime("%H:%M")
+        taken = ""
+        if row["taken_at"]:
+            taken = "｜服藥 " + row["taken_at"].astimezone(TAIPEI_TZ).strftime("%H:%M")
+        lines.append(
+            f"{index}. {scheduled}｜{row['medication_name']}｜"
+            f"{status_map.get(row['status'],row['status'])}{taken}"
+        )
+    return "\n".join(lines)
+
+
+def family_missed_text(patient):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT ml.scheduled_at,ml.status::text,
+                   COALESCE(m.medication_name,'未命名藥物'),ml.note
+            FROM medication_logs ml
+            JOIN medications m ON m.id=ml.medication_id
+            WHERE ml.patient_id=%s
+              AND (
+                    ml.status::text='missed'
+                    OR (
+                        ml.status::text='scheduled'
+                        AND ml.scheduled_at < CURRENT_TIMESTAMP - INTERVAL '30 minutes'
+                    )
+              )
+              AND ml.scheduled_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+            ORDER BY ml.scheduled_at DESC
+            """,
+            (patient["patient_id"],),
+        )
+        rows = cursor.fetchall()
+    finally:
+        connection.close()
+    if not rows:
+        return f"{patient['display_name']}最近 7 天沒有漏服或逾時未確認紀錄。"
+    lines = [f"{patient['display_name']}最近 7 天的漏服通知："]
+    for index,row in enumerate(rows,1):
+        when = row[0].astimezone(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M")
+        status = "漏服" if row[1] == "missed" else "逾時未確認"
+        lines.append(f"{index}. {when}｜{row[2]}｜{status}")
+        if row[3]:
+            lines.append(f"   備註：{row[3]}")
+    return "\n".join(lines)
+
+
+def family_discomfort_text(patient):
+    records = list_patient_abnormal_reports(patient["patient_id"],days=None)
+    if not records:
+        return f"{patient['display_name']}目前沒有不舒服紀錄。"
+    lines = [f"{patient['display_name']}的不舒服紀錄："]
+    for index,record in enumerate(records[:30],1):
+        when = record["occurred_at"].astimezone(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M")
+        lines.extend([
+            "",
+            f"{index}. {when}｜{record.get('report_type') or '其他問題'}",
+            f"程度：{record.get('severity') or '未分級'}",
+            f"回報者：{record['reporter_name']}（{record['reporter_role']}）",
+            f"說明：{record.get('description') or '未填寫'}",
+        ])
+    return "\n".join(lines)
+
+
+def family_adherence_text(patient,days):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT status::text,COUNT(*)
+            FROM medication_logs
+            WHERE patient_id=%s
+              AND scheduled_at >= CURRENT_TIMESTAMP - (%s * INTERVAL '1 day')
+            GROUP BY status::text
+            """,
+            (patient["patient_id"],days),
+        )
+        counts = dict(cursor.fetchall())
+    finally:
+        connection.close()
+    total = sum(counts.values())
+    if total == 0:
+        return f"{patient['display_name']}最近 {days} 天沒有服藥紀錄。"
+    taken = counts.get("taken",0) + counts.get("late",0)
+    rate = round(taken / total * 100,1)
+    return (
+        f"{patient['display_name']}最近 {days} 天服藥率統計：\n\n"
+        f"總排程：{total} 筆\n"
+        f"已服藥：{counts.get('taken',0)} 筆\n"
+        f"延遲服藥：{counts.get('late',0)} 筆\n"
+        f"漏服：{counts.get('missed',0)} 筆\n"
+        f"略過：{counts.get('skipped',0)} 筆\n"
+        f"待確認：{counts.get('scheduled',0)} 筆\n\n"
+        f"服藥率：{rate}%"
+    )
+
+
+def upsert_family_emergency_contact(
+    patient_id,priority_order,contact_name,relationship,
+    phone_number,line_user_id=None,
+):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO emergency_contacts (
+                patient_id,contact_name,relationship,phone_number,
+                line_user_id,priority_order,is_active,updated_at
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,TRUE,CURRENT_TIMESTAMP)
+            ON CONFLICT (patient_id,priority_order)
+            DO UPDATE SET
+                contact_name=EXCLUDED.contact_name,
+                relationship=EXCLUDED.relationship,
+                phone_number=EXCLUDED.phone_number,
+                line_user_id=EXCLUDED.line_user_id,
+                is_active=TRUE,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (
+                patient_id,contact_name,relationship,phone_number,
+                line_user_id,priority_order,
+            ),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def send_monitor_patient_selection(event,user_id,action,family_id):
+    patients = list_family_patients(family_id)
+    if not patients:
+        reply_text(event.reply_token,"目前家庭尚未新增長者。")
+        return True
+    if len(patients) == 1:
+        return handle_monitor_selected_patient(event,user_id,action,patients[0])
+    set_operation_state(user_id,action,"monitor_select_patient",{})
+    items = [
+        postback_item(
+            p["display_name"],
+            f"action=family_monitor_select_patient&next_action={action}&patient_id={p['patient_id']}",
+            f"選擇 {p['display_name']}",
+        )
+        for p in patients[:12]
+    ]
+    reply_message(
+        event.reply_token,
+        make_quick_reply_message(
+            f"{MONITOR_ACTIONS[action]}\n請選擇長者：",items
+        ),
+    )
+    return True
+
+
+def handle_monitor_selected_patient(event,user_id,action,patient):
+    if action == "family_monitor_today_status":
+        reply_text(event.reply_token,family_today_status_text(patient))
+        return True
+    if action == "family_monitor_missed":
+        reply_text(event.reply_token,family_missed_text(patient))
+        return True
+    if action == "family_monitor_discomfort":
+        reply_text(event.reply_token,family_discomfort_text(patient))
+        return True
+    if action == "family_monitor_adherence":
+        set_operation_state(
+            user_id,action,"monitor_adherence_days",
+            {
+                "patient_id":str(patient["patient_id"]),
+                "patient_name":patient["display_name"],
+            },
+        )
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                f"請選擇 {patient['display_name']} 的統計期間：",
+                [
+                    postback_item("最近 7 天","action=family_monitor_adherence_7"),
+                    postback_item("最近 30 天","action=family_monitor_adherence_30"),
+                    postback_item("取消","action=family_cancel"),
+                ],
+            ),
+        )
+        return True
+    if action == "family_monitor_emergency":
+        contacts = list_elder_contacts(patient["patient_id"])
+        current = []
+        for i in range(2):
+            if i < len(contacts):
+                contact = contacts[i]
+                current.append(
+                    f"聯絡人 {i+1}：{contact['name']}｜"
+                    f"{contact.get('phone') or '未填電話'}"
+                )
+            else:
+                current.append(f"聯絡人 {i+1}：尚未設定")
+        set_operation_state(
+            user_id,action,"monitor_contact_select",
+            {
+                "patient_id":str(patient["patient_id"]),
+                "patient_name":patient["display_name"],
+            },
+        )
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                (
+                    f"{patient['display_name']}的指定緊急聯絡人：\n"
+                    + "\n".join(current)
+                    + "\n\n請選擇要設定的位置："
+                ),
+                [
+                    postback_item(
+                        "設定聯絡人 1",
+                        "action=family_monitor_contact_select&priority=1",
+                    ),
+                    postback_item(
+                        "設定聯絡人 2",
+                        "action=family_monitor_contact_select&priority=2",
+                    ),
+                    postback_item("取消","action=family_cancel"),
+                ],
+            ),
+        )
+        return True
+    return False
+
+
+def handle_family_monitor_postback(event,action,params):
+    user_id = get_user_id(event)
+    family = ensure_family_admin(user_id)
+    family_id = family["id"]
+
+    if action in MONITOR_ACTIONS:
+        return send_monitor_patient_selection(event,user_id,action,family_id)
+
+    if action == "family_monitor_select_patient":
+        next_action = params.get("next_action",[None])[0]
+        patient_id = params.get("patient_id",[None])[0]
+        if next_action not in MONITOR_ACTIONS:
+            raise RuntimeError("監控功能資料已逾時")
+        patient = get_family_patient(family_id,patient_id)
+        if not patient:
+            raise RuntimeError("找不到這位長者")
+        return handle_monitor_selected_patient(event,user_id,next_action,patient)
+
+    if action in {"family_monitor_adherence_7","family_monitor_adherence_30"}:
+        state = get_operation_state(user_id)
+        payload = state.get("payload",{}) if state else {}
+        patient = get_family_patient(family_id,payload.get("patient_id"))
+        if not patient:
+            raise RuntimeError("統計資料已逾時")
+        days = 7 if action.endswith("_7") else 30
+        clear_operation_state(user_id)
+        reply_text(event.reply_token,family_adherence_text(patient,days))
+        return True
+
+    if action == "family_monitor_contact_select":
+        state = get_operation_state(user_id)
+        payload = state.get("payload",{}) if state else {}
+        priority = params.get("priority",[None])[0]
+        if not payload.get("patient_id") or priority not in {"1","2"}:
+            raise RuntimeError("聯絡人設定資料已逾時")
+        payload["priority"] = int(priority)
+        set_operation_state(
+            user_id,"family_monitor_emergency",
+            "waiting_monitor_contact_name",payload
+        )
+        reply_text(event.reply_token,f"請輸入緊急聯絡人 {priority} 的姓名：")
+        return True
+    return False
 
 # =========================================================
 # 家屬報表紀錄
