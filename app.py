@@ -2,6 +2,11 @@ from flask import Flask, request, abort
 import os
 import json
 import traceback
+import math
+import re
+from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
 from urllib.parse import parse_qs
 
 import requests
@@ -21,6 +26,11 @@ from linebot.v3.messaging import (
     QuickReply,
     QuickReplyItem,
     PostbackAction,
+    DatetimePickerAction,
+    CameraAction,
+    CameraRollAction,
+    URIAction,
+    PushMessageRequest,
 )
 from linebot.v3.webhooks import (
     MessageEvent,
@@ -840,6 +850,1204 @@ def bind_role_rich_menu(user_id, role):
 
 
 
+
+
+ELDER_MEDICATION_ACTIONS = {
+    "elder_today_breakfast",
+    "elder_today_lunch",
+    "elder_today_dinner",
+    "elder_today_bedtime",
+    "elder_today_all",
+    "elder_taken_breakfast",
+    "elder_taken_lunch",
+    "elder_taken_dinner",
+    "elder_taken_bedtime",
+    "elder_taken_today",
+    "elder_confirm_taken_meal",
+    "elder_cancel",
+    "elder_medicine_list",
+    "elder_medicine_info",
+    "elder_medicine_remaining",
+    "elder_medicine_capture",
+    "elder_medicine_stop",
+    "elder_medicine_select",
+    "elder_medicine_confirm_stop",
+    "elder_discomfort_dizziness",
+    "elder_discomfort_headache",
+    "elder_discomfort_nausea",
+    "elder_discomfort_sleep",
+    "elder_discomfort_other",
+    "elder_discomfort_confirm",
+    "elder_calendar_view",
+    "elder_calendar_add",
+    "elder_calendar_edit",
+    "elder_calendar_delete",
+    "elder_calendar_reminder",
+    "elder_calendar_select_event",
+    "elder_calendar_save_datetime",
+    "elder_calendar_confirm_delete",
+    "elder_sos_contact1",
+    "elder_sos_contact2",
+    "elder_sos_notify_all",
+}
+
+
+
+# =========================================================
+# 長者：今日用藥與我已服藥
+# =========================================================
+
+TAIPEI_TZ = ZoneInfo("Asia/Taipei")
+
+ELDER_MEAL_LABELS = {
+    "breakfast": "早餐藥物",
+    "lunch": "午餐藥物",
+    "dinner": "晚餐藥物",
+    "bedtime": "睡前藥物",
+}
+
+ELDER_TODAY_ACTION_MEALS = {
+    "elder_today_breakfast": "breakfast",
+    "elder_today_lunch": "lunch",
+    "elder_today_dinner": "dinner",
+    "elder_today_bedtime": "bedtime",
+}
+
+ELDER_TAKEN_ACTION_MEALS = {
+    "elder_taken_breakfast": "breakfast",
+    "elder_taken_lunch": "lunch",
+    "elder_taken_dinner": "dinner",
+    "elder_taken_bedtime": "bedtime",
+}
+
+
+def taipei_now():
+    return datetime.now(TAIPEI_TZ)
+
+
+
+def get_elder_patient_by_line_user_id(line_user_id):
+    """
+    取得長者使用者與 patient。
+    若使用者已是長者身份，但 patients 尚未建立，會自動建立基本長者資料。
+    """
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                u.id,
+                COALESCE(NULLIF(u.display_name, ''), '長者'),
+                LOWER(r.code),
+                p.id,
+                COALESCE(NULLIF(p.full_name, ''), NULLIF(u.display_name, ''), '長者')
+            FROM app_users u
+            JOIN roles r ON r.id = u.role_id
+            LEFT JOIN patients p
+              ON p.linked_user_id = u.id
+             AND p.is_active = TRUE
+            WHERE u.line_user_id = %s
+              AND u.is_active = TRUE
+            ORDER BY p.updated_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            (line_user_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise RuntimeError("找不到目前使用者資料，請重新加入 Bot 並設定身份")
+
+        role_code = row[2]
+        if role_code not in {"elderly", "elder", "patient"}:
+            raise RuntimeError(
+                f"目前身份為「{role_code}」，請先在身份設定中切換為長者"
+            )
+
+        patient_id = row[3]
+        patient_name = row[4]
+
+        if not patient_id:
+            cursor.execute(
+                """
+                INSERT INTO patients (
+                    linked_user_id,
+                    full_name,
+                    notes,
+                    is_active
+                )
+                VALUES (%s,%s,'長者首次使用功能時自動建立',TRUE)
+                RETURNING id
+                """,
+                (row[0], patient_name),
+            )
+            patient_id = cursor.fetchone()[0]
+            connection.commit()
+
+        return {
+            "user_id": row[0],
+            "display_name": row[1],
+            "role": role_code,
+            "patient_id": patient_id,
+            "patient_name": patient_name,
+        }
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def normalize_meal_slot(meal_slot, schedule_time=None):
+    if meal_slot in ELDER_MEAL_LABELS:
+        return meal_slot
+
+    if schedule_time is None:
+        return None
+
+    hour = schedule_time.hour
+    if 4 <= hour < 11:
+        return "breakfast"
+    if 11 <= hour < 16:
+        return "lunch"
+    if 16 <= hour < 21:
+        return "dinner"
+    return "bedtime"
+
+
+def list_elder_today_medications(patient_id, meal_slot=None):
+    """
+    取得今天有效的用藥排程。
+    meal_slot 優先使用資料庫欄位；舊資料沒有 meal_slot 時，以 schedule_time 推算。
+    """
+    today = taipei_now().date()
+    weekday = today.isoweekday()
+
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                ms.id,
+                ms.medication_id,
+                ms.schedule_time,
+                ms.dose_amount,
+                ms.before_or_after_meal,
+                ms.meal_slot,
+                m.medication_name,
+                m.generic_name,
+                m.dosage,
+                m.dosage_form,
+                m.instructions,
+                ml.id,
+                ml.status::text,
+                ml.taken_at,
+                ml.note
+            FROM medication_schedules ms
+            JOIN medications m
+              ON m.id = ms.medication_id
+            LEFT JOIN medication_logs ml
+              ON ml.schedule_id = ms.id
+             AND ml.patient_id = m.patient_id
+             AND (ml.scheduled_at AT TIME ZONE 'Asia/Taipei')::date = %s
+            WHERE m.patient_id = %s
+              AND m.is_active = TRUE
+              AND ms.is_active = TRUE
+              AND (ms.starts_on IS NULL OR ms.starts_on <= %s)
+              AND (ms.ends_on IS NULL OR ms.ends_on >= %s)
+              AND %s = ANY(ms.weekdays)
+            ORDER BY ms.schedule_time, m.medication_name
+            """,
+            (today, patient_id, today, today, weekday),
+        )
+        result = []
+        for row in cursor.fetchall():
+            slot = normalize_meal_slot(row[5], row[2])
+            if meal_slot and slot != meal_slot:
+                continue
+            result.append({
+                "schedule_id": row[0],
+                "medication_id": row[1],
+                "schedule_time": row[2],
+                "dose_amount": row[3],
+                "meal_relation": row[4],
+                "meal_slot": slot,
+                "medication_name": row[6] or "未命名藥物",
+                "generic_name": row[7],
+                "dosage": row[8],
+                "dosage_form": row[9],
+                "instructions": row[10],
+                "log_id": row[11],
+                "status": row[12],
+                "taken_at": row[13],
+                "log_note": row[14],
+            })
+        return result
+    finally:
+        connection.close()
+
+
+def medication_status_text(status):
+    return {
+        None: "尚未回報",
+        "scheduled": "尚未回報",
+        "taken": "已服藥",
+        "missed": "漏服",
+        "skipped": "略過",
+        "late": "延遲服藥",
+    }.get(status, status or "尚未回報")
+
+
+def elder_medication_list_text(patient, meal_slot=None):
+    medications = list_elder_today_medications(
+        patient["patient_id"],
+        meal_slot=meal_slot,
+    )
+    title = (
+        ELDER_MEAL_LABELS[meal_slot]
+        if meal_slot
+        else "今日全部藥物"
+    )
+
+    if not medications:
+        return f"{patient['patient_name']}的{title}：\n目前沒有需要使用的藥物。"
+
+    grouped = {}
+    for medication in medications:
+        slot = medication["meal_slot"] or "other"
+        grouped.setdefault(slot, []).append(medication)
+
+    lines = [
+        f"{patient['patient_name']}的{title}：",
+        f"日期：{taipei_now().strftime('%Y-%m-%d')}",
+    ]
+
+    display_order = ["breakfast", "lunch", "dinner", "bedtime", "other"]
+    for slot in display_order:
+        items = grouped.get(slot, [])
+        if not items:
+            continue
+        lines.extend([
+            "",
+            f"【{ELDER_MEAL_LABELS.get(slot, '其他時段')}】",
+        ])
+        for index, item in enumerate(items, 1):
+            time_text = (
+                item["schedule_time"].strftime("%H:%M")
+                if item["schedule_time"]
+                else "未設定"
+            )
+            dose_text = item["dose_amount"] or item["dosage"] or "未標示"
+            lines.extend([
+                f"{index}. {item['medication_name']}",
+                f"   時間：{time_text}",
+                f"   每次量：{dose_text}",
+                f"   飯前／飯後：{item['meal_relation'] or '未標示'}",
+                f"   狀態：{medication_status_text(item['status'])}",
+            ])
+            if item.get("instructions"):
+                lines.append(f"   用法：{item['instructions']}")
+
+    return "\n".join(lines)
+
+
+def ensure_today_scheduled_log(patient_id, medication):
+    now = taipei_now()
+    scheduled_local = datetime.combine(
+        now.date(),
+        medication["schedule_time"],
+        tzinfo=TAIPEI_TZ,
+    )
+
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO medication_logs (
+                schedule_id,
+                medication_id,
+                patient_id,
+                scheduled_at,
+                status,
+                created_at,
+                updated_at
+            )
+            VALUES (%s,%s,%s,%s,'scheduled',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+            ON CONFLICT (schedule_id, patient_id, scheduled_local_date)
+            DO UPDATE SET
+                medication_id = EXCLUDED.medication_id,
+                scheduled_at = EXCLUDED.scheduled_at,
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING id, status::text
+            """,
+            (
+                medication["schedule_id"],
+                medication["medication_id"],
+                patient_id,
+                scheduled_local,
+            ),
+        )
+        row = cursor.fetchone()
+        connection.commit()
+        return row[0], row[1]
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def mark_elder_meal_taken(patient, meal_slot, reported_by):
+    medications = list_elder_today_medications(
+        patient["patient_id"],
+        meal_slot=meal_slot,
+    )
+    if not medications:
+        raise RuntimeError(
+            f"今天沒有設定{ELDER_MEAL_LABELS[meal_slot]}，無法建立服藥紀錄"
+        )
+
+    now = taipei_now()
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        updated = []
+        already_taken = []
+
+        for medication in medications:
+            scheduled_local = datetime.combine(
+                now.date(),
+                medication["schedule_time"],
+                tzinfo=TAIPEI_TZ,
+            )
+            cursor.execute(
+                """
+                INSERT INTO medication_logs (
+                    schedule_id,
+                    medication_id,
+                    patient_id,
+                    scheduled_at,
+                    taken_at,
+                    status,
+                    reported_by,
+                    note,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    %s,%s,%s,%s,%s,'taken',%s,%s,
+                    CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+                )
+                ON CONFLICT (schedule_id, patient_id, scheduled_local_date)
+                DO UPDATE SET
+                    taken_at = CASE
+                        WHEN medication_logs.status = 'taken'
+                            THEN medication_logs.taken_at
+                        ELSE EXCLUDED.taken_at
+                    END,
+                    status = 'taken',
+                    reported_by = EXCLUDED.reported_by,
+                    note = EXCLUDED.note,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING status::text, taken_at
+                """,
+                (
+                    medication["schedule_id"],
+                    medication["medication_id"],
+                    patient["patient_id"],
+                    scheduled_local,
+                    now,
+                    reported_by,
+                    f"長者確認已服用{ELDER_MEAL_LABELS[meal_slot]}",
+                ),
+            )
+            result = cursor.fetchone()
+            if medication.get("status") == "taken":
+                already_taken.append(medication["medication_name"])
+            else:
+                updated.append(medication["medication_name"])
+
+        connection.commit()
+        return {
+            "updated": updated,
+            "already_taken": already_taken,
+            "taken_at": now,
+        }
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def elder_today_taken_record_text(patient):
+    medications = list_elder_today_medications(patient["patient_id"])
+    if not medications:
+        return (
+            f"{patient['patient_name']}的今日服藥紀錄：\n"
+            "今天沒有用藥排程。"
+        )
+
+    lines = [
+        f"{patient['patient_name']}的今日服藥紀錄：",
+        f"日期：{taipei_now().strftime('%Y-%m-%d')}",
+    ]
+
+    grouped = {}
+    for item in medications:
+        grouped.setdefault(item["meal_slot"] or "other", []).append(item)
+
+    for slot in ["breakfast", "lunch", "dinner", "bedtime", "other"]:
+        items = grouped.get(slot, [])
+        if not items:
+            continue
+        taken_count = sum(1 for item in items if item["status"] == "taken")
+        lines.extend([
+            "",
+            (
+                f"【{ELDER_MEAL_LABELS.get(slot, '其他時段')}】"
+                f" {taken_count}/{len(items)} 已服"
+            ),
+        ])
+        for item in items:
+            taken_time = (
+                item["taken_at"].astimezone(TAIPEI_TZ).strftime("%H:%M")
+                if item.get("taken_at")
+                else None
+            )
+            status = medication_status_text(item.get("status"))
+            if taken_time:
+                status += f"（{taken_time}）"
+            lines.append(f"・{item['medication_name']}：{status}")
+
+    return "\n".join(lines)
+
+
+def handle_elder_medication_postback(event, action, params):
+    if action not in {
+        "elder_today_breakfast",
+        "elder_today_lunch",
+        "elder_today_dinner",
+        "elder_today_bedtime",
+        "elder_today_all",
+        "elder_taken_breakfast",
+        "elder_taken_lunch",
+        "elder_taken_dinner",
+        "elder_taken_bedtime",
+        "elder_taken_today",
+        "elder_confirm_taken_meal",
+        "elder_cancel",
+    }:
+        return handle_elder_extended_postback(event, action, params)
+
+    line_user_id = get_user_id(event)
+    if not line_user_id:
+        reply_text(event.reply_token, "無法取得您的 LINE User ID。")
+        return True
+
+    patient = get_elder_patient_by_line_user_id(line_user_id)
+
+    if action in ELDER_TODAY_ACTION_MEALS:
+        meal_slot = ELDER_TODAY_ACTION_MEALS[action]
+        reply_text(
+            event.reply_token,
+            elder_medication_list_text(patient, meal_slot),
+        )
+        return True
+
+    if action == "elder_today_all":
+        reply_text(
+            event.reply_token,
+            elder_medication_list_text(patient, meal_slot=None),
+        )
+        return True
+
+    if action in ELDER_TAKEN_ACTION_MEALS:
+        meal_slot = ELDER_TAKEN_ACTION_MEALS[action]
+        medications = list_elder_today_medications(
+            patient["patient_id"],
+            meal_slot=meal_slot,
+        )
+        if not medications:
+            reply_text(
+                event.reply_token,
+                f"今天沒有設定{ELDER_MEAL_LABELS[meal_slot]}。",
+            )
+            return True
+
+        not_taken = [
+            item for item in medications
+            if item.get("status") != "taken"
+        ]
+        if not not_taken:
+            reply_text(
+                event.reply_token,
+                (
+                    f"{ELDER_MEAL_LABELS[meal_slot]}已經完成回報。\n\n"
+                    + elder_today_taken_record_text(patient)
+                ),
+            )
+            return True
+
+        medication_names = "\n".join(
+            f"・{item['medication_name']}（{item['dose_amount'] or item['dosage'] or '未標示'}）"
+            for item in medications
+        )
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                (
+                    f"確認已吃完{ELDER_MEAL_LABELS[meal_slot]}的所有藥物？\n\n"
+                    f"{medication_names}"
+                ),
+                [
+                    postback_item(
+                        "確認已服藥",
+                        (
+                            "action=elder_confirm_taken_meal"
+                            f"&meal_slot={meal_slot}"
+                        ),
+                    ),
+                    postback_item("取消", "action=elder_cancel"),
+                ],
+            ),
+        )
+        return True
+
+    if action == "elder_confirm_taken_meal":
+        meal_slot = params.get("meal_slot", [None])[0]
+        if meal_slot not in ELDER_MEAL_LABELS:
+            raise RuntimeError("服藥時段資料不正確")
+
+        result = mark_elder_meal_taken(
+            patient,
+            meal_slot,
+            patient["user_id"],
+        )
+        lines = [
+            f"{ELDER_MEAL_LABELS[meal_slot]}服藥紀錄已完成。",
+            f"紀錄時間：{result['taken_at'].strftime('%Y-%m-%d %H:%M')}",
+        ]
+        if result["updated"]:
+            lines.extend([
+                "",
+                "本次已記錄：",
+                *[f"・{name}" for name in result["updated"]],
+            ])
+        if result["already_taken"]:
+            lines.extend([
+                "",
+                "先前已記錄：",
+                *[f"・{name}" for name in result["already_taken"]],
+            ])
+        reply_text(event.reply_token, "\n".join(lines))
+        return True
+
+    if action == "elder_taken_today":
+        reply_text(
+            event.reply_token,
+            elder_today_taken_record_text(patient),
+        )
+        return True
+
+    if action == "elder_cancel":
+        reply_text(event.reply_token, "已取消本次操作。")
+        return True
+
+    return False
+
+
+
+# =========================================================
+# 長者：我的藥物、身體不適、行事曆、SOS
+# =========================================================
+
+def camera_quick_reply_message():
+    return TextMessage(
+        text="請選擇拍攝藥單的方式：",
+        quick_reply=QuickReply(
+            items=[
+                QuickReplyItem(
+                    action=CameraAction(label="開啟相機")
+                ),
+                QuickReplyItem(
+                    action=CameraRollAction(label="從圖庫選擇")
+                ),
+                postback_item("取消", "action=elder_cancel"),
+            ]
+        ),
+    )
+
+
+def list_elder_active_medications(patient_id):
+    return list_patient_medications(patient_id, active_only=True)
+
+
+def elder_medicine_list_text(patient):
+    medications = list_elder_active_medications(patient["patient_id"])
+    if not medications:
+        return f"{patient['patient_name']}目前沒有使用中的藥物。"
+
+    lines = [f"{patient['patient_name']}目前使用中的藥物："]
+    for index, medication in enumerate(medications, 1):
+        inv = _medication_inventory_values(medication)
+        lines.extend([
+            "",
+            f"{index}. {medication['medication_name']}",
+            f"含量：{medication.get('dosage') or '未標示'}",
+            f"用法：{medication.get('instructions') or '未標示'}",
+            f"剩餘：{_format_quantity(inv['remaining'])} {medication['quantity_unit']}",
+        ])
+    return "\n".join(lines)
+
+
+def save_elder_discomfort(patient, reported_by, symptom, description=None):
+    severity_map = {
+        "頭暈": "moderate",
+        "頭痛": "moderate",
+        "想吐": "moderate",
+        "睡不好": "mild",
+        "其他問題": "normal",
+    }
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO abnormal_reports (
+                patient_id, reported_by, report_type, severity,
+                description, occurred_at, is_active
+            )
+            VALUES (%s,%s,%s,%s,%s,CURRENT_TIMESTAMP,TRUE)
+            """,
+            (
+                patient["patient_id"],
+                reported_by,
+                symptom,
+                severity_map.get(symptom, "normal"),
+                description or symptom,
+            ),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def list_elder_contacts(patient_id):
+    """
+    優先讀取 emergency_contacts。
+    若家屬端尚未建立專用緊急聯絡人，就以同家庭家屬成員作為備援。
+    """
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                contact_name,
+                relationship,
+                phone_number,
+                line_user_id,
+                priority_order
+            FROM emergency_contacts
+            WHERE patient_id=%s AND is_active=TRUE
+            ORDER BY priority_order, created_at
+            """,
+            (patient_id,),
+        )
+        rows = cursor.fetchall()
+        contacts = [{
+            "name": r[0],
+            "relationship": r[1] or "家屬",
+            "phone": r[2],
+            "line_user_id": r[3],
+            "priority": r[4],
+        } for r in rows]
+
+        if contacts:
+            return contacts
+
+        cursor.execute(
+            """
+            SELECT DISTINCT
+                COALESCE(NULLIF(fu.display_name,''),'家屬'),
+                fu.line_user_id
+            FROM patients p
+            JOIN family_members elder_member
+              ON elder_member.user_id = p.linked_user_id
+             AND elder_member.member_role = 'elderly'
+             AND elder_member.is_active = TRUE
+            JOIN family_members family_member
+              ON family_member.family_id = elder_member.family_id
+             AND family_member.member_role = 'family'
+             AND family_member.is_active = TRUE
+            JOIN app_users fu
+              ON fu.id = family_member.user_id
+             AND fu.is_active = TRUE
+            WHERE p.id=%s
+            ORDER BY 1
+            """,
+            (patient_id,),
+        )
+        return [{
+            "name": r[0],
+            "relationship": "家屬",
+            "phone": None,
+            "line_user_id": r[1],
+            "priority": index,
+        } for index, r in enumerate(cursor.fetchall(), 1)]
+    finally:
+        connection.close()
+
+
+def notify_elder_family(patient, message):
+    contacts = list_elder_contacts(patient["patient_id"])
+    line_ids = [c["line_user_id"] for c in contacts if c.get("line_user_id")]
+
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT DISTINCT flg.line_group_id
+            FROM patients p
+            JOIN family_members em
+              ON em.user_id=p.linked_user_id
+             AND em.member_role='elderly'
+             AND em.is_active=TRUE
+            JOIN family_line_groups flg
+              ON flg.family_id=em.family_id
+             AND flg.is_active=TRUE
+            WHERE p.id=%s
+            """,
+            (patient["patient_id"],),
+        )
+        line_ids.extend(row[0] for row in cursor.fetchall() if row[0])
+    finally:
+        connection.close()
+
+    sent = 0
+    failed = 0
+    for target_id in dict.fromkeys(line_ids):
+        api_client, messaging_api = get_messaging_api()
+        try:
+            messaging_api.push_message(
+                PushMessageRequest(
+                    to=target_id,
+                    messages=[TextMessage(text=safe_text(message))],
+                )
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+            app.logger.error(traceback.format_exc())
+        finally:
+            api_client.close()
+    return sent, failed
+
+
+def elder_calendar_text(patient):
+    events = list_patient_calendar_events(
+        patient["patient_id"],
+        upcoming_only=False,
+        limit=30,
+    )
+    return calendar_event_text(
+        {
+            "display_name": patient["patient_name"],
+            "patient_id": patient["patient_id"],
+        },
+        events,
+    )
+
+
+def handle_elder_extended_postback(event, action, params):
+    line_user_id = get_user_id(event)
+    patient = get_elder_patient_by_line_user_id(line_user_id)
+
+    if action == "elder_medicine_list":
+        reply_text(event.reply_token, elder_medicine_list_text(patient))
+        return True
+
+    if action == "elder_medicine_info":
+        medications = list_elder_active_medications(patient["patient_id"])
+        if not medications:
+            reply_text(event.reply_token, "目前沒有可查看說明的藥物。")
+            return True
+        items = [
+            postback_item(
+                medication["medication_name"][:20],
+                f"action=elder_medicine_select&mode=info&medication_id={medication['id']}",
+            )
+            for medication in medications[:12]
+        ]
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message("請選擇要查看說明的藥物：", items),
+        )
+        return True
+
+    if action == "elder_medicine_remaining":
+        medications = list_elder_active_medications(patient["patient_id"])
+        reply_text(
+            event.reply_token,
+            remaining_summary_text(
+                {
+                    "display_name": patient["patient_name"],
+                    "patient_id": patient["patient_id"],
+                },
+                medications,
+                low_only=False,
+            ),
+        )
+        return True
+
+    if action == "elder_medicine_capture":
+        set_operation_state(
+            line_user_id,
+            action,
+            "waiting_elder_prescription_image",
+            {"patient_id": str(patient["patient_id"])},
+        )
+        reply_message(event.reply_token, camera_quick_reply_message())
+        return True
+
+    if action == "elder_medicine_stop":
+        medications = list_elder_active_medications(patient["patient_id"])
+        if not medications:
+            reply_text(event.reply_token, "目前沒有可停用的藥物。")
+            return True
+        items = [
+            postback_item(
+                medication["medication_name"][:20],
+                f"action=elder_medicine_select&mode=stop&medication_id={medication['id']}",
+            )
+            for medication in medications[:12]
+        ]
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                "請選擇要提出停用的藥物。停藥前仍應先詢問醫師：",
+                items,
+            ),
+        )
+        return True
+
+    if action == "elder_medicine_select":
+        medication_id = params.get("medication_id", [None])[0]
+        mode = params.get("mode", [None])[0]
+        medication = get_patient_medication(patient["patient_id"], medication_id)
+        if not medication:
+            raise RuntimeError("找不到這筆藥物資料")
+
+        if mode == "info":
+            inv = _medication_inventory_values(medication)
+            reply_text(
+                event.reply_token,
+                (
+                    f"藥物：{medication['medication_name']}\n"
+                    f"學名：{medication.get('generic_name') or '未標示'}\n"
+                    f"含量：{medication.get('dosage') or '未標示'}\n"
+                    f"用法：{medication.get('instructions') or '未標示'}\n"
+                    f"目前剩餘：{_format_quantity(inv['remaining'])} "
+                    f"{medication['quantity_unit']}"
+                ),
+            )
+            return True
+
+        if mode == "stop":
+            set_operation_state(
+                line_user_id,
+                "elder_medicine_stop",
+                "confirm_stop",
+                {
+                    "patient_id": str(patient["patient_id"]),
+                    "medication_id": str(medication["id"]),
+                    "medication_name": medication["medication_name"],
+                },
+            )
+            reply_message(
+                event.reply_token,
+                make_quick_reply_message(
+                    (
+                        f"確定將「{medication['medication_name']}」標記為停用？\n"
+                        "請確認這是醫師指示，不要自行停藥。"
+                    ),
+                    [
+                        postback_item(
+                            "確認停用",
+                            "action=elder_medicine_confirm_stop",
+                        ),
+                        postback_item("取消", "action=elder_cancel"),
+                    ],
+                ),
+            )
+            return True
+
+    if action == "elder_medicine_confirm_stop":
+        state = get_operation_state(line_user_id)
+        payload = state.get("payload", {}) if state else {}
+        medication_id = payload.get("medication_id")
+        if not medication_id:
+            raise RuntimeError("停用資料已逾時")
+        connection = get_db_connection()
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                UPDATE medications
+                SET is_active=FALSE, end_date=COALESCE(end_date,CURRENT_DATE),
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=%s AND patient_id=%s
+                """,
+                (medication_id, patient["patient_id"]),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        clear_operation_state(line_user_id)
+        reply_text(
+            event.reply_token,
+            f"已將「{payload.get('medication_name','該藥物')}」標記為停用。",
+        )
+        return True
+
+    symptom_actions = {
+        "elder_discomfort_dizziness": "頭暈",
+        "elder_discomfort_headache": "頭痛",
+        "elder_discomfort_nausea": "想吐",
+        "elder_discomfort_sleep": "睡不好",
+    }
+    if action in symptom_actions:
+        symptom = symptom_actions[action]
+        save_elder_discomfort(
+            patient,
+            patient["user_id"],
+            symptom,
+            symptom,
+        )
+        reply_text(
+            event.reply_token,
+            f"已記錄不舒服狀況：{symptom}\n家屬端可在「異常統計」中查看。",
+        )
+        return True
+
+    if action == "elder_discomfort_other":
+        set_operation_state(
+            line_user_id,
+            action,
+            "waiting_elder_discomfort_text",
+            {"patient_id": str(patient["patient_id"])},
+        )
+        reply_text(
+            event.reply_token,
+            "請描述目前不舒服的情況，例如：胸悶、皮膚癢。\n輸入「取消」可結束。",
+        )
+        return True
+
+    if action == "elder_calendar_view":
+        reply_text(event.reply_token, elder_calendar_text(patient))
+        return True
+
+    if action == "elder_calendar_add":
+        set_operation_state(
+            line_user_id,
+            action,
+            "waiting_elder_calendar_title",
+            {"patient_id": str(patient["patient_id"]), "patient_name": patient["patient_name"]},
+        )
+        reply_text(event.reply_token, "請輸入行程名稱，例如：回診、領藥。")
+        return True
+
+    if action in {"elder_calendar_edit", "elder_calendar_delete"}:
+        events = list_patient_calendar_events(patient["patient_id"], upcoming_only=False)
+        if not events:
+            reply_text(event.reply_token, "目前沒有可操作的行程。")
+            return True
+        mode = "edit" if action == "elder_calendar_edit" else "delete"
+        items = [
+            postback_item(
+                f"{item['starts_at'].strftime('%m/%d')} {item['title']}"[:20],
+                f"action=elder_calendar_select_event&mode={mode}&event_id={item['id']}",
+            )
+            for item in events[:12]
+        ]
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                "請選擇行程：",
+                items,
+            ),
+        )
+        return True
+
+    if action == "elder_calendar_select_event":
+        event_id = params.get("event_id", [None])[0]
+        mode = params.get("mode", [None])[0]
+        calendar_item = get_patient_calendar_event(patient["patient_id"], event_id)
+        if not calendar_item:
+            raise RuntimeError("找不到行程")
+
+        if mode == "delete":
+            set_operation_state(
+                line_user_id,
+                "elder_calendar_delete",
+                "confirm_elder_calendar_delete",
+                {"event_id": str(event_id), "event_title": calendar_item["title"]},
+            )
+            reply_message(
+                event.reply_token,
+                make_quick_reply_message(
+                    f"確定刪除「{calendar_item['title']}」？",
+                    [
+                        postback_item(
+                            "確認刪除",
+                            "action=elder_calendar_confirm_delete",
+                        ),
+                        postback_item("取消", "action=elder_cancel"),
+                    ],
+                ),
+            )
+            return True
+
+        set_operation_state(
+            line_user_id,
+            "elder_calendar_edit",
+            "waiting_elder_calendar_datetime",
+            {"event_id": str(event_id), "event_title": calendar_item["title"]},
+        )
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                "請選擇新的日期與時間：",
+                [
+                    datetime_item(
+                        "選擇日期時間",
+                        "action=elder_calendar_save_datetime&mode=edit",
+                        mode="datetime",
+                        minimum=taipei_now().strftime("%Y-%m-%dT%H:%M"),
+                    ),
+                    postback_item("取消", "action=elder_cancel"),
+                ],
+            ),
+        )
+        return True
+
+    if action == "elder_calendar_save_datetime":
+        state = get_operation_state(line_user_id)
+        payload = state.get("payload", {}) if state else {}
+        dt_value = getattr(getattr(event.postback, "params", None), "datetime", None)
+        if not dt_value:
+            raise RuntimeError("沒有取得日期時間")
+        selected_dt = datetime.fromisoformat(dt_value).replace(tzinfo=TAIPEI_TZ)
+        mode = params.get("mode", [None])[0]
+
+        if mode == "add":
+            create_patient_calendar_event(
+                patient["patient_id"],
+                payload["calendar_title"],
+                payload.get("calendar_description"),
+                payload.get("calendar_location"),
+                selected_dt,
+                patient["user_id"],
+            )
+            clear_operation_state(line_user_id)
+            reply_text(event.reply_token, "行程新增完成。")
+            return True
+
+        update_patient_calendar_event(
+            payload["event_id"],
+            patient["patient_id"],
+            "starts_at",
+            selected_dt,
+        )
+        clear_operation_state(line_user_id)
+        reply_text(event.reply_token, "行程日期時間修改完成。")
+        return True
+
+    if action == "elder_calendar_confirm_delete":
+        state = get_operation_state(line_user_id)
+        payload = state.get("payload", {}) if state else {}
+        delete_patient_calendar_event(
+            payload["event_id"],
+            patient["patient_id"],
+        )
+        clear_operation_state(line_user_id)
+        reply_text(
+            event.reply_token,
+            f"已刪除行程：{payload.get('event_title','未命名行程')}",
+        )
+        return True
+
+    if action == "elder_calendar_reminder":
+        reply_text(
+            event.reply_token,
+            "回診提醒由家屬端設定；您可以在行事曆中查看已安排的回診日期。",
+        )
+        return True
+
+    if action in {"elder_sos_contact1", "elder_sos_contact2"}:
+        index = 0 if action.endswith("contact1") else 1
+        contacts = list_elder_contacts(patient["patient_id"])
+        if len(contacts) <= index:
+            reply_text(event.reply_token, f"目前尚未設定緊急聯絡人 {index + 1}。")
+            return True
+        contact = contacts[index]
+        items = []
+        if contact.get("phone"):
+            items.append(
+                QuickReplyItem(
+                    action=URIAction(
+                        label="立即撥打",
+                        uri=f"tel:{contact['phone']}",
+                    )
+                )
+            )
+        if contact.get("line_user_id"):
+            items.append(
+                postback_item(
+                    "傳送緊急通知",
+                    "action=elder_sos_notify_all",
+                )
+            )
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                (
+                    f"緊急聯絡人 {index + 1}\n"
+                    f"姓名：{contact['name']}\n"
+                    f"關係：{contact['relationship']}\n"
+                    f"電話：{contact.get('phone') or '未設定'}"
+                ),
+                items or [postback_item("返回", "action=elder_cancel")],
+            ),
+        )
+        return True
+
+    if action == "elder_sos_notify_all":
+        message = (
+            f"【長者緊急通知】\n"
+            f"{patient['patient_name']}按下了緊急通知。\n"
+            f"時間：{taipei_now().strftime('%Y-%m-%d %H:%M')}\n"
+            "請儘快確認長者狀況。"
+        )
+        sent, failed = notify_elder_family(patient, message)
+        reply_text(
+            event.reply_token,
+            f"緊急通知已送出。\n成功：{sent} 位／群組\n失敗：{failed}",
+        )
+        return True
+
+    return False
+
 # =========================================================
 # 家庭管理功能
 # =========================================================
@@ -857,6 +2065,42 @@ FAMILY_ACTIONS = {
     "family_select_caregiver",
     "family_select_elder_for_caregiver",
     "family_confirm_assignment",
+    "family_medication_list",
+    "family_medication_correct",
+    "family_medication_remaining",
+    "family_medication_low",
+    "family_medication_bag_records",
+    "family_medication_select_patient",
+    "family_medication_select_item",
+    "family_medication_select_bag",
+    "family_medication_confirm_quantity",
+    "family_calendar_view",
+    "family_calendar_add",
+    "family_calendar_edit",
+    "family_calendar_delete",
+    "family_calendar_reminder",
+    "family_calendar_select_patient",
+    "family_calendar_select_event",
+    "family_calendar_select_edit_field",
+    "family_calendar_save_datetime",
+    "family_calendar_confirm_delete",
+    "family_calendar_enable_reminder",
+    "family_calendar_disable_reminder",
+    "family_report_today",
+    "family_report_7days",
+    "family_report_30days",
+    "family_report_abnormal",
+    "family_report_summary",
+    "family_report_select_patient",
+    "family_monitor_today_status",
+    "family_monitor_missed",
+    "family_monitor_emergency",
+    "family_monitor_discomfort",
+    "family_monitor_adherence",
+    "family_monitor_select_patient",
+    "family_monitor_adherence_7",
+    "family_monitor_adherence_30",
+    "family_monitor_contact_select",
     "family_cancel",
 }
 
@@ -886,6 +2130,18 @@ def postback_item(label, data, display_text=None):
             display_text=(display_text or label)[:300],
         )
     )
+
+
+
+def datetime_item(label, data, mode="datetime", initial=None, minimum=None, maximum=None):
+    kwargs = {"label": label[:20], "data": data, "mode": mode}
+    if initial:
+        kwargs["initial"] = initial
+    if minimum:
+        kwargs["min"] = minimum
+    if maximum:
+        kwargs["max"] = maximum
+    return QuickReplyItem(action=DatetimePickerAction(**kwargs))
 
 
 def get_app_user_by_line_id(line_user_id):
@@ -1130,10 +2386,160 @@ def handle_family_text_input(event, user_text, user_id):
         clear_operation_state(user_id)
         reply_text(event.reply_token,f"家庭群組綁定完成！\nGroup ID：{user_text}")
         return True
+    if state["step"] == "waiting_actual_quantity":
+        payload = state.get("payload", {})
+        actual_quantity = _parse_numeric_quantity(user_text)
+        payload["actual_quantity"] = str(actual_quantity)
+        set_operation_state(
+            user_id,
+            "family_medication_correct",
+            "confirm_actual_quantity",
+            payload,
+        )
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                (
+                    f"長者：{payload['patient_name']}\n"
+                    f"藥物：{payload['medication_name']}\n"
+                    f"系統計算：{_format_quantity(payload['calculated_quantity'])} "
+                    f"{payload['quantity_unit']}\n"
+                    f"實際剩餘：{_format_quantity(actual_quantity)} "
+                    f"{payload['quantity_unit']}\n\n"
+                    "確定儲存這次修正？"
+                ),
+                [
+                    postback_item(
+                        "確認修正",
+                        "action=family_medication_confirm_quantity",
+                    ),
+                    postback_item("取消", "action=family_cancel"),
+                ],
+            ),
+        )
+        return True
+
+    if state["step"] == "waiting_calendar_title":
+        payload = state.get("payload", {})
+        payload["calendar_title"] = user_text[:255]
+        set_operation_state(user_id,"family_calendar_add","waiting_calendar_location",payload)
+        reply_text(event.reply_token,
+            "請輸入醫院或地點，例如：埔里基督教醫院\n若沒有地點請輸入「未填寫」。")
+        return True
+
+    if state["step"] == "waiting_calendar_location":
+        payload = state.get("payload", {})
+        payload["calendar_location"] = None if user_text in {"未填寫","無","沒有"} else user_text[:500]
+        set_operation_state(user_id,"family_calendar_add","calendar_waiting_datetime",payload)
+        reply_message(event.reply_token,make_quick_reply_message(
+            "請點選預計前往醫院的日期與時間：",
+            [
+                datetime_item("選擇日期時間",
+                    "action=family_calendar_save_datetime&mode=add",
+                    mode="datetime",
+                    minimum=datetime.now().strftime("%Y-%m-%dT%H:%M")),
+                postback_item("取消","action=family_cancel"),
+            ]))
+        return True
+
+    if state["step"] == "waiting_calendar_edit_title":
+        payload = state.get("payload", {})
+        update_patient_calendar_event(
+            payload["event_id"],payload["patient_id"],"title",user_text[:255])
+        clear_operation_state(user_id)
+        reply_text(event.reply_token,f"行程名稱已修改為：{user_text[:255]}")
+        return True
+
+    if state["step"] == "waiting_calendar_edit_location":
+        payload = state.get("payload", {})
+        new_location = None if user_text in {"未填寫","無","沒有"} else user_text[:500]
+        update_patient_calendar_event(
+            payload["event_id"],payload["patient_id"],"location",new_location)
+        clear_operation_state(user_id)
+        reply_text(event.reply_token,f"行程地點已修改為：{new_location or '未填寫'}")
+        return True
+
+
+    if state["step"] == "waiting_monitor_contact_name":
+        payload = state.get("payload", {})
+        payload["contact_name"] = user_text[:255]
+        set_operation_state(
+            user_id,"family_monitor_emergency",
+            "waiting_monitor_contact_relationship",payload
+        )
+        reply_text(
+            event.reply_token,
+            "請輸入與長者的關係，例如：女兒、兒子、配偶。"
+        )
+        return True
+
+    if state["step"] == "waiting_monitor_contact_relationship":
+        payload = state.get("payload", {})
+        payload["relationship"] = user_text[:100]
+        set_operation_state(
+            user_id,"family_monitor_emergency",
+            "waiting_monitor_contact_phone",payload
+        )
+        reply_text(event.reply_token,"請輸入聯絡電話，例如：0912345678。")
+        return True
+
+    if state["step"] == "waiting_monitor_contact_phone":
+        payload = state.get("payload", {})
+        phone = re.sub(r"[^0-9+]", "", user_text)
+        if len(phone) < 8:
+            raise RuntimeError("電話格式不正確，請重新輸入")
+        payload["phone_number"] = phone
+        set_operation_state(
+            user_id,"family_monitor_emergency",
+            "waiting_monitor_contact_line",payload
+        )
+        reply_text(
+            event.reply_token,
+            "請輸入此聯絡人的 LINE User ID；若沒有請輸入「略過」。"
+        )
+        return True
+
+    if state["step"] == "waiting_monitor_contact_line":
+        payload = state.get("payload", {})
+        line_user_id = None if user_text in {"略過","無","沒有"} else user_text
+        upsert_family_emergency_contact(
+            payload["patient_id"],
+            payload["priority"],
+            payload["contact_name"],
+            payload["relationship"],
+            payload["phone_number"],
+            line_user_id,
+        )
+        clear_operation_state(user_id)
+        reply_text(
+            event.reply_token,
+            (
+                "緊急聯絡人設定完成！\n"
+                f"長者：{payload['patient_name']}\n"
+                f"順位：{payload['priority']}\n"
+                f"姓名：{payload['contact_name']}\n"
+                f"關係：{payload['relationship']}\n"
+                f"電話：{payload['phone_number']}"
+            ),
+        )
+        return True
+
     return False
 
 
 def handle_family_postback(event, action, params):
+    if action.startswith("family_monitor_"):
+        return handle_family_monitor_postback(event, action, params)
+
+    if action.startswith("family_report_"):
+        return handle_family_report_postback(event, action, params)
+
+    if action.startswith("family_calendar_"):
+        return handle_family_calendar_postback(event, action, params)
+
+    if action.startswith("family_medication_"):
+        return handle_family_medication_postback(event, action, params)
+
     user_id=get_user_id(event)
     if not user_id:
         reply_text(event.reply_token,"無法取得您的 LINE User ID。")
@@ -1150,7 +2556,9 @@ def handle_family_postback(event, action, params):
         if not state or not state.get("payload",{}).get("target_id"):
             raise RuntimeError("新增資料已逾時，請重新操作")
         import uuid
-        bind_member_to_family(family_id,uuid.UUID(state["payload"]["target_id"]),"elderly",admin_id)
+        elder_uuid = uuid.UUID(state["payload"]["target_id"])
+        bind_member_to_family(family_id,elder_uuid,"elderly",admin_id)
+        ensure_patient_for_elder_user(elder_uuid)
         clear_operation_state(user_id)
         reply_text(event.reply_token,f"已成功新增長者：{state['payload'].get('display_name') or '未命名'}")
     elif action == "family_manage_elder":
@@ -1217,6 +2625,1803 @@ def handle_family_postback(event, action, params):
     else:
         return False
     return True
+
+
+# =========================================================
+# 家屬藥物管理
+# =========================================================
+
+MEDICATION_ACTION_LABELS = {
+    "family_medication_list": "查看藥物",
+    "family_medication_correct": "修正藥物",
+    "family_medication_remaining": "藥量剩餘",
+    "family_medication_low": "藥快用完",
+    "family_medication_bag_records": "藥袋紀錄",
+}
+
+
+def _to_decimal(value, default=Decimal("0")):
+    if value is None:
+        return default
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return default
+
+
+def _format_quantity(value):
+    number = _to_decimal(value)
+    if number == number.to_integral():
+        return str(int(number))
+    return format(number.normalize(), "f")
+
+
+def _parse_numeric_quantity(text_value):
+    match = re.search(r"-?\d+(?:\.\d+)?", str(text_value or ""))
+    if not match:
+        raise RuntimeError("請輸入數字，例如：27")
+    value = Decimal(match.group())
+    if value < 0:
+        raise RuntimeError("藥物數量不能小於 0")
+    return value
+
+
+def ensure_patient_for_elder_user(elder_user_id):
+    """取得長者的 patients.id；家庭新增長者後若尚未建檔就自動建立。"""
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT p.id, p.full_name
+            FROM patients p
+            WHERE p.linked_user_id = %s
+            ORDER BY p.is_active DESC, p.updated_at DESC
+            LIMIT 1
+            """,
+            (elder_user_id,),
+        )
+        row = cursor.fetchone()
+        if row:
+            if not row[1]:
+                cursor.execute(
+                    """
+                    UPDATE patients p
+                    SET full_name = COALESCE(u.display_name, '未命名長者'),
+                        is_active = TRUE,
+                        updated_at = CURRENT_TIMESTAMP
+                    FROM app_users u
+                    WHERE p.id = %s AND u.id = %s
+                    """,
+                    (row[0], elder_user_id),
+                )
+                connection.commit()
+            return row[0]
+
+        cursor.execute(
+            "SELECT COALESCE(NULLIF(display_name,''), '未命名長者') FROM app_users WHERE id=%s",
+            (elder_user_id,),
+        )
+        user_row = cursor.fetchone()
+        if not user_row:
+            raise RuntimeError("找不到長者使用者資料")
+
+        cursor.execute(
+            """
+            INSERT INTO patients (linked_user_id, full_name, notes, is_active)
+            VALUES (%s, %s, '由家庭管理功能自動建立', TRUE)
+            RETURNING id
+            """,
+            (elder_user_id, user_row[0]),
+        )
+        patient_id = cursor.fetchone()[0]
+        connection.commit()
+        return patient_id
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def list_family_patients(family_id):
+    """列出家庭中所有有效長者，以及其 patient_id。"""
+    elders = list_family_members(family_id, "elderly")
+    result = []
+    for elder in elders:
+        patient_id = ensure_patient_for_elder_user(elder["id"])
+        item = dict(elder)
+        item["patient_id"] = patient_id
+        result.append(item)
+    return result
+
+
+def get_family_patient(family_id, patient_id):
+    for patient in list_family_patients(family_id):
+        if str(patient["patient_id"]) == str(patient_id):
+            return patient
+    return None
+
+
+def _medication_inventory_values(row, today=None):
+    today = today or date.today()
+    dispense_date = row.get("dispense_date") or row.get("start_date")
+    course_days = row.get("course_days")
+    total_quantity = _to_decimal(row.get("total_quantity"))
+    dose_per_time = _to_decimal(row.get("dose_per_time"), Decimal("1"))
+    times_per_day = _to_decimal(row.get("times_per_day"), Decimal("1"))
+    daily_quantity = max(dose_per_time * times_per_day, Decimal("0"))
+
+    if dispense_date and isinstance(dispense_date, datetime):
+        dispense_date = dispense_date.date()
+
+    elapsed_days = max((today - dispense_date).days, 0) if dispense_date else 0
+    calculated = max(total_quantity - (Decimal(elapsed_days) * daily_quantity), Decimal("0"))
+
+    adjusted_quantity = row.get("adjusted_quantity")
+    adjusted_at = row.get("adjusted_at")
+    if adjusted_quantity is not None and adjusted_at:
+        adjusted_date = adjusted_at.date() if isinstance(adjusted_at, datetime) else adjusted_at
+        adjusted_elapsed = max((today - adjusted_date).days, 0)
+        remaining = max(
+            _to_decimal(adjusted_quantity) - (Decimal(adjusted_elapsed) * daily_quantity),
+            Decimal("0"),
+        )
+        basis = f"人工修正（{adjusted_date}）"
+    else:
+        remaining = calculated
+        basis = "依調劑日期與每日用量計算"
+
+    if course_days and dispense_date:
+        expected_end_date = dispense_date + timedelta(days=max(int(course_days) - 1, 0))
+    elif row.get("end_date"):
+        expected_end_date = row["end_date"]
+    elif daily_quantity > 0 and total_quantity > 0 and dispense_date:
+        expected_end_date = dispense_date + timedelta(
+            days=max(math.ceil(float(total_quantity / daily_quantity)) - 1, 0)
+        )
+    else:
+        expected_end_date = None
+
+    warning_date = expected_end_date - timedelta(days=3) if expected_end_date else None
+    days_remaining = (
+        math.ceil(float(remaining / daily_quantity))
+        if daily_quantity > 0
+        else None
+    )
+
+    return {
+        "dispense_date": dispense_date,
+        "course_days": course_days,
+        "total_quantity": total_quantity,
+        "daily_quantity": daily_quantity,
+        "elapsed_days": elapsed_days,
+        "remaining": remaining,
+        "basis": basis,
+        "expected_end_date": expected_end_date,
+        "warning_date": warning_date,
+        "days_remaining": days_remaining,
+    }
+
+
+def list_patient_medications(patient_id, active_only=True):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                m.id,
+                m.medication_name,
+                m.generic_name,
+                m.dosage,
+                m.instructions,
+                m.start_date,
+                m.end_date,
+                m.is_active,
+                m.dispense_date,
+                m.course_days,
+                m.total_quantity,
+                m.dose_per_time,
+                m.times_per_day,
+                m.quantity_unit,
+                a.actual_quantity,
+                a.created_at
+            FROM medications m
+            LEFT JOIN LATERAL (
+                SELECT actual_quantity, created_at
+                FROM medication_inventory_adjustments mia
+                WHERE mia.medication_id = m.id
+                ORDER BY mia.created_at DESC
+                LIMIT 1
+            ) a ON TRUE
+            WHERE m.patient_id = %s
+              AND (%s = FALSE OR m.is_active = TRUE)
+            ORDER BY COALESCE(m.dispense_date, m.start_date) DESC NULLS LAST,
+                     m.created_at DESC
+            """,
+            (patient_id, active_only),
+        )
+        rows = cursor.fetchall()
+        result = []
+        for row in rows:
+            result.append({
+                "id": row[0],
+                "medication_name": row[1] or "未命名藥物",
+                "generic_name": row[2],
+                "dosage": row[3],
+                "instructions": row[4],
+                "start_date": row[5],
+                "end_date": row[6],
+                "is_active": row[7],
+                "dispense_date": row[8],
+                "course_days": row[9],
+                "total_quantity": row[10],
+                "dose_per_time": row[11],
+                "times_per_day": row[12],
+                "quantity_unit": row[13] or "份",
+                "adjusted_quantity": row[14],
+                "adjusted_at": row[15],
+            })
+        return result
+    finally:
+        connection.close()
+
+
+def get_patient_medication(patient_id, medication_id):
+    for medication in list_patient_medications(patient_id, active_only=False):
+        if str(medication["id"]) == str(medication_id):
+            return medication
+    return None
+
+
+def save_inventory_adjustment(
+    medication_id,
+    patient_id,
+    adjusted_by,
+    calculated_quantity,
+    actual_quantity,
+    reason="家屬修正實際剩餘數量",
+):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO medication_inventory_adjustments (
+                medication_id,
+                patient_id,
+                adjusted_by,
+                calculated_quantity,
+                actual_quantity,
+                quantity_difference,
+                reason
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (
+                medication_id,
+                patient_id,
+                adjusted_by,
+                calculated_quantity,
+                actual_quantity,
+                actual_quantity - calculated_quantity,
+                reason,
+            ),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def list_medication_bag_records(patient_id, limit=12):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                s.id,
+                s.created_at,
+                s.processing_status,
+                s.original_text,
+                s.parsed_result,
+                s.image_path,
+                COALESCE(u.display_name, '未知使用者'),
+                COALESCE(r.name_zh_tw, r.code, '未知身份')
+            FROM ai_medication_scans s
+            LEFT JOIN app_users u ON u.id = s.uploaded_by
+            LEFT JOIN roles r ON r.id = u.role_id
+            WHERE s.patient_id = %s
+            ORDER BY s.created_at DESC
+            LIMIT %s
+            """,
+            (patient_id, limit),
+        )
+        rows = cursor.fetchall()
+        return [{
+            "id": r[0],
+            "created_at": r[1],
+            "status": r[2],
+            "original_text": r[3],
+            "parsed_result": r[4],
+            "image_path": r[5],
+            "uploader_name": r[6],
+            "uploader_role": r[7],
+        } for r in rows]
+    finally:
+        connection.close()
+
+
+def get_medication_bag_record(patient_id, scan_id):
+    records = list_medication_bag_records(patient_id, limit=50)
+    for record in records:
+        if str(record["id"]) == str(scan_id):
+            return record
+    return None
+
+
+def send_patient_selection(event, user_id, action, family_id):
+    patients = list_family_patients(family_id)
+    if not patients:
+        reply_text(event.reply_token, "目前家庭尚未新增任何長者。請先到「家庭管理」新增長者。")
+        return True
+
+    set_operation_state(user_id, action, "select_patient", {})
+    if len(patients) == 1:
+        patient = patients[0]
+        return handle_selected_patient(event, user_id, action, patient)
+
+    items = [
+        postback_item(
+            p["display_name"],
+            f"action=family_medication_select_patient&next_action={action}&patient_id={p['patient_id']}",
+            f"選擇 {p['display_name']}",
+        )
+        for p in patients[:12]
+    ]
+    reply_message(
+        event.reply_token,
+        make_quick_reply_message(
+            f"{MEDICATION_ACTION_LABELS.get(action, '藥物管理')}\n請選擇長者：",
+            items,
+        ),
+    )
+    return True
+
+
+def medication_summary_text(patient, medications):
+    if not medications:
+        return f"{patient['display_name']}目前沒有使用中的藥物。"
+
+    lines = [f"{patient['display_name']}目前使用中的藥物："]
+    for index, medication in enumerate(medications, 1):
+        inventory = _medication_inventory_values(medication)
+        lines.extend([
+            "",
+            f"{index}. {medication['medication_name']}",
+            f"含量：{medication.get('dosage') or '未標示'}",
+            f"用法：{medication.get('instructions') or '未標示'}",
+            f"調劑日期：{inventory['dispense_date'] or '未標示'}",
+            f"處方天數：{inventory['course_days'] or '未標示'}",
+            f"總量：{_format_quantity(inventory['total_quantity'])} {medication['quantity_unit']}",
+        ])
+    return "\n".join(lines)
+
+
+def remaining_summary_text(patient, medications, low_only=False):
+    lines = [
+        (
+            f"{patient['display_name']}三天內可能用完的藥物："
+            if low_only
+            else f"{patient['display_name']}的藥物剩餘："
+        )
+    ]
+    matched = 0
+    today = date.today()
+
+    for medication in medications:
+        inventory = _medication_inventory_values(medication, today=today)
+        low = False
+        if inventory["warning_date"] and inventory["expected_end_date"]:
+            low = inventory["warning_date"] <= today <= inventory["expected_end_date"]
+        if inventory["daily_quantity"] > 0:
+            low = low or inventory["remaining"] <= inventory["daily_quantity"] * Decimal("3")
+
+        if low_only and not low:
+            continue
+
+        matched += 1
+        lines.extend([
+            "",
+            f"{matched}. {medication['medication_name']}",
+            f"目前剩餘：{_format_quantity(inventory['remaining'])} {medication['quantity_unit']}",
+            f"每日使用：{_format_quantity(inventory['daily_quantity'])} {medication['quantity_unit']}",
+            f"已經過：{inventory['elapsed_days']} 天",
+            f"預計用完：{inventory['expected_end_date'] or '無法計算'}",
+            f"計算基準：{inventory['basis']}",
+        ])
+        if inventory["days_remaining"] is not None:
+            lines.append(f"預估還可使用：{inventory['days_remaining']} 天")
+
+    if matched == 0:
+        return (
+            f"{patient['display_name']}目前沒有三天內即將用完的藥物。"
+            if low_only
+            else f"{patient['display_name']}目前沒有可計算剩餘量的藥物。"
+        )
+    return "\n".join(lines)
+
+
+def handle_selected_patient(event, user_id, action, patient):
+    patient_id = patient["patient_id"]
+    payload = {
+        "patient_id": str(patient_id),
+        "patient_name": patient["display_name"],
+    }
+
+    if action == "family_medication_list":
+        clear_operation_state(user_id)
+        reply_text(
+            event.reply_token,
+            medication_summary_text(
+                patient,
+                list_patient_medications(patient_id, active_only=True),
+            ),
+        )
+        return True
+
+    if action == "family_medication_remaining":
+        clear_operation_state(user_id)
+        reply_text(
+            event.reply_token,
+            remaining_summary_text(
+                patient,
+                list_patient_medications(patient_id, active_only=True),
+                low_only=False,
+            ),
+        )
+        return True
+
+    if action == "family_medication_low":
+        clear_operation_state(user_id)
+        reply_text(
+            event.reply_token,
+            remaining_summary_text(
+                patient,
+                list_patient_medications(patient_id, active_only=True),
+                low_only=True,
+            ),
+        )
+        return True
+
+    if action == "family_medication_correct":
+        medications = list_patient_medications(patient_id, active_only=True)
+        if not medications:
+            clear_operation_state(user_id)
+            reply_text(event.reply_token, f"{patient['display_name']}目前沒有可修正的藥物。")
+            return True
+        set_operation_state(user_id, action, "select_medication", payload)
+        items = [
+            postback_item(
+                m["medication_name"][:20],
+                f"action=family_medication_select_item&medication_id={m['id']}",
+            )
+            for m in medications[:12]
+        ]
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                f"長者：{patient['display_name']}\n請選擇要修正數量的藥物：",
+                items,
+            ),
+        )
+        return True
+
+    if action == "family_medication_bag_records":
+        records = list_medication_bag_records(patient_id)
+        if not records:
+            clear_operation_state(user_id)
+            reply_text(event.reply_token, f"{patient['display_name']}目前沒有藥袋拍攝紀錄。")
+            return True
+        set_operation_state(user_id, action, "select_bag_record", payload)
+        items = []
+        for record in records[:12]:
+            created = record["created_at"].strftime("%Y-%m-%d %H:%M")
+            items.append(
+                postback_item(
+                    created[:20],
+                    f"action=family_medication_select_bag&scan_id={record['id']}",
+                    f"查看 {created}",
+                )
+            )
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                f"{patient['display_name']}的藥袋紀錄\n請選擇一筆：",
+                items,
+            ),
+        )
+        return True
+
+    return False
+
+
+def handle_family_medication_postback(event, action, params):
+    user_id = get_user_id(event)
+    if not user_id:
+        reply_text(event.reply_token, "無法取得您的 LINE User ID。")
+        return True
+
+    family = ensure_family_admin(user_id)
+    family_id = family["id"]
+    admin_id = family["admin_user_id"]
+
+    if action in MEDICATION_ACTION_LABELS:
+        return send_patient_selection(event, user_id, action, family_id)
+
+    if action == "family_medication_select_patient":
+        next_action = params.get("next_action", [None])[0]
+        patient_id = params.get("patient_id", [None])[0]
+        patient = get_family_patient(family_id, patient_id)
+        if not patient:
+            raise RuntimeError("找不到這位長者，或長者已不在此家庭")
+        if next_action not in MEDICATION_ACTION_LABELS:
+            raise RuntimeError("藥物功能資料已逾時")
+        return handle_selected_patient(event, user_id, next_action, patient)
+
+    if action == "family_medication_select_item":
+        state = get_operation_state(user_id)
+        medication_id = params.get("medication_id", [None])[0]
+        payload = state.get("payload", {}) if state else {}
+        patient_id = payload.get("patient_id")
+        patient = get_family_patient(family_id, patient_id)
+        medication = (
+            get_patient_medication(patient_id, medication_id)
+            if patient and patient_id
+            else None
+        )
+        if not patient or not medication:
+            raise RuntimeError("修正資料已逾時，請重新操作")
+
+        inventory = _medication_inventory_values(medication)
+        payload.update({
+            "medication_id": str(medication["id"]),
+            "medication_name": medication["medication_name"],
+            "calculated_quantity": str(inventory["remaining"]),
+            "quantity_unit": medication["quantity_unit"],
+        })
+        set_operation_state(
+            user_id,
+            "family_medication_correct",
+            "waiting_actual_quantity",
+            payload,
+        )
+        reply_text(
+            event.reply_token,
+            (
+                f"長者：{patient['display_name']}\n"
+                f"藥物：{medication['medication_name']}\n"
+                f"系統計算剩餘：{_format_quantity(inventory['remaining'])} "
+                f"{medication['quantity_unit']}\n\n"
+                "請輸入實際剩餘數量，例如：27\n"
+                "輸入「取消」可結束操作。"
+            ),
+        )
+        return True
+
+    if action == "family_medication_confirm_quantity":
+        state = get_operation_state(user_id)
+        payload = state.get("payload", {}) if state else {}
+        required = {
+            "patient_id",
+            "medication_id",
+            "actual_quantity",
+            "calculated_quantity",
+        }
+        if not required.issubset(payload):
+            raise RuntimeError("修正資料已逾時，請重新操作")
+
+        patient = get_family_patient(family_id, payload["patient_id"])
+        if not patient:
+            raise RuntimeError("找不到這位長者")
+
+        save_inventory_adjustment(
+            medication_id=payload["medication_id"],
+            patient_id=payload["patient_id"],
+            adjusted_by=admin_id,
+            calculated_quantity=_to_decimal(payload["calculated_quantity"]),
+            actual_quantity=_to_decimal(payload["actual_quantity"]),
+        )
+        clear_operation_state(user_id)
+        reply_text(
+            event.reply_token,
+            (
+                "藥物數量修正完成！\n"
+                f"長者：{payload['patient_name']}\n"
+                f"藥物：{payload['medication_name']}\n"
+                f"原計算：{_format_quantity(payload['calculated_quantity'])} "
+                f"{payload['quantity_unit']}\n"
+                f"修正後：{_format_quantity(payload['actual_quantity'])} "
+                f"{payload['quantity_unit']}"
+            ),
+        )
+        return True
+
+    if action == "family_medication_select_bag":
+        state = get_operation_state(user_id)
+        payload = state.get("payload", {}) if state else {}
+        patient_id = payload.get("patient_id")
+        scan_id = params.get("scan_id", [None])[0]
+        patient = get_family_patient(family_id, patient_id)
+        record = get_medication_bag_record(patient_id, scan_id) if patient else None
+        if not patient or not record:
+            raise RuntimeError("藥袋紀錄已逾時，請重新操作")
+
+        clear_operation_state(user_id)
+        parsed = record.get("parsed_result")
+        if parsed:
+            details = json.dumps(parsed, ensure_ascii=False, indent=2)
+        else:
+            details = record.get("original_text") or "未保存辨識內容"
+
+        reply_text(
+            event.reply_token,
+            (
+                f"長者：{patient['display_name']}\n"
+                f"拍攝時間：{record['created_at'].strftime('%Y-%m-%d %H:%M')}\n"
+                f"上傳者：{record['uploader_name']}（{record['uploader_role']}）\n"
+                f"辨識狀態：{record['status']}\n\n"
+                f"{details}"
+            ),
+        )
+        return True
+
+    return False
+
+
+# =========================================================
+# 家屬行事曆管理
+# =========================================================
+
+CALENDAR_ACTION_LABELS = {
+    "family_calendar_view": "查看行事曆",
+    "family_calendar_add": "新增行程",
+    "family_calendar_edit": "修改行程",
+    "family_calendar_delete": "刪除行程",
+    "family_calendar_reminder": "回診提醒",
+}
+
+
+def list_patient_calendar_events(patient_id, upcoming_only=True, limit=30):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT id,title,description,location,starts_at,ends_at,
+                   all_day,event_type,COALESCE(is_active,TRUE)
+            FROM calendar_events
+            WHERE patient_id=%s
+              AND COALESCE(is_active,TRUE)=TRUE
+              AND (%s=FALSE OR starts_at >= CURRENT_TIMESTAMP - INTERVAL '1 day')
+            ORDER BY starts_at ASC
+            LIMIT %s
+            """,
+            (patient_id, upcoming_only, limit),
+        )
+        return [{
+            "id": r[0], "title": r[1], "description": r[2],
+            "location": r[3], "starts_at": r[4], "ends_at": r[5],
+            "all_day": r[6], "event_type": r[7], "is_active": r[8],
+        } for r in cursor.fetchall()]
+    finally:
+        connection.close()
+
+
+def get_patient_calendar_event(patient_id, event_id):
+    for item in list_patient_calendar_events(patient_id, upcoming_only=False, limit=100):
+        if str(item["id"]) == str(event_id):
+            return item
+    return None
+
+
+def create_patient_calendar_event(patient_id,title,description,location,starts_at,created_by,event_type="hospital_visit"):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO calendar_events (
+                patient_id,title,description,location,starts_at,ends_at,
+                all_day,event_type,created_by,source_type,is_active
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,FALSE,%s,%s,'manual',TRUE)
+            RETURNING id
+            """,
+            (patient_id,title,description,location,starts_at,
+             starts_at + timedelta(hours=1),event_type,created_by),
+        )
+        event_id = cursor.fetchone()[0]
+        connection.commit()
+        return event_id
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def update_patient_calendar_event(event_id,patient_id,field,value):
+    allowed = {"title":"title","location":"location","starts_at":"starts_at"}
+    column = allowed.get(field)
+    if not column:
+        raise RuntimeError("不支援的行事曆修改欄位")
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        if field == "starts_at":
+            cursor.execute(
+                """
+                UPDATE calendar_events
+                SET starts_at=%s, ends_at=%s + INTERVAL '1 hour',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=%s AND patient_id=%s AND COALESCE(is_active,TRUE)=TRUE
+                """,
+                (value,value,event_id,patient_id),
+            )
+        else:
+            cursor.execute(
+                f"""
+                UPDATE calendar_events
+                SET {column}=%s, updated_at=CURRENT_TIMESTAMP
+                WHERE id=%s AND patient_id=%s AND COALESCE(is_active,TRUE)=TRUE
+                """,
+                (value,event_id,patient_id),
+            )
+        if cursor.rowcount == 0:
+            raise RuntimeError("找不到要修改的行程")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def delete_patient_calendar_event(event_id,patient_id):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE calendar_events
+            SET is_active=FALSE, updated_at=CURRENT_TIMESTAMP
+            WHERE id=%s AND patient_id=%s AND COALESCE(is_active,TRUE)=TRUE
+            """,
+            (event_id,patient_id),
+        )
+        if cursor.rowcount == 0:
+            raise RuntimeError("找不到要刪除的行程")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def get_followup_reminder_setting(patient_id,family_user_id):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT is_enabled,days_before,reminder_time
+            FROM followup_reminder_settings
+            WHERE patient_id=%s AND family_user_id=%s
+            """,
+            (patient_id,family_user_id),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {"is_enabled":False,"days_before":3,"reminder_time":"09:00"}
+        return {"is_enabled":row[0],"days_before":row[1],"reminder_time":str(row[2])[:5]}
+    finally:
+        connection.close()
+
+
+def save_followup_reminder_setting(patient_id,family_user_id,is_enabled,days_before=3,reminder_time="09:00"):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO followup_reminder_settings (
+                patient_id,family_user_id,is_enabled,days_before,reminder_time,updated_at
+            )
+            VALUES (%s,%s,%s,%s,%s,CURRENT_TIMESTAMP)
+            ON CONFLICT (patient_id,family_user_id)
+            DO UPDATE SET is_enabled=EXCLUDED.is_enabled,
+                          days_before=EXCLUDED.days_before,
+                          reminder_time=EXCLUDED.reminder_time,
+                          updated_at=CURRENT_TIMESTAMP
+            """,
+            (patient_id,family_user_id,is_enabled,days_before,reminder_time),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def calendar_event_text(patient,events):
+    if not events:
+        return f"{patient['display_name']}目前沒有行事曆行程。"
+    lines = [f"{patient['display_name']}的行事曆："]
+    for index,item in enumerate(events,1):
+        event_name = "原訂回診" if item.get("event_type") == "follow_up" else "自行新增"
+        lines.extend([
+            "",
+            f"{index}. {item['title']}",
+            f"時間：{item['starts_at'].strftime('%Y-%m-%d %H:%M')}",
+            f"類型：{event_name}",
+            f"地點：{item.get('location') or '未填寫'}",
+        ])
+        if item.get("description"):
+            lines.append(f"備註：{item['description']}")
+    return "\n".join(lines)
+
+
+def send_calendar_patient_selection(event,user_id,action,family_id):
+    patients = list_family_patients(family_id)
+    if not patients:
+        reply_text(event.reply_token,"目前家庭尚未新增長者，請先到「家庭管理」新增長者。")
+        return True
+    if len(patients) == 1:
+        return handle_calendar_selected_patient(event,user_id,action,patients[0])
+    set_operation_state(user_id,action,"calendar_select_patient",{})
+    items = [
+        postback_item(
+            p["display_name"],
+            f"action=family_calendar_select_patient&next_action={action}&patient_id={p['patient_id']}",
+            f"選擇 {p['display_name']}",
+        )
+        for p in patients[:12]
+    ]
+    reply_message(event.reply_token,make_quick_reply_message(
+        f"{CALENDAR_ACTION_LABELS.get(action,'行事曆')}\n請選擇長者：",items))
+    return True
+
+
+def handle_calendar_selected_patient(event,user_id,action,patient):
+    patient_id = patient["patient_id"]
+    payload = {"patient_id":str(patient_id),"patient_name":patient["display_name"]}
+
+    if action == "family_calendar_view":
+        clear_operation_state(user_id)
+        reply_text(event.reply_token,calendar_event_text(
+            patient,list_patient_calendar_events(patient_id,upcoming_only=False)))
+        return True
+
+    if action == "family_calendar_add":
+        set_operation_state(user_id,action,"waiting_calendar_title",payload)
+        reply_text(event.reply_token,
+            f"長者：{patient['display_name']}\n請輸入行程名稱，例如：\n用藥後不舒服回診\n\n輸入「取消」可結束。")
+        return True
+
+    if action in {"family_calendar_edit","family_calendar_delete"}:
+        events = list_patient_calendar_events(patient_id,upcoming_only=False)
+        if not events:
+            clear_operation_state(user_id)
+            reply_text(event.reply_token,f"{patient['display_name']}目前沒有可操作的行程。")
+            return True
+        payload["calendar_action"] = action
+        set_operation_state(user_id,action,"calendar_select_event",payload)
+        items = [
+            postback_item(
+                f"{item['starts_at'].strftime('%m/%d')} {item['title']}"[:20],
+                f"action=family_calendar_select_event&calendar_action={action}&event_id={item['id']}",
+            )
+            for item in events[:12]
+        ]
+        verb = "修改" if action == "family_calendar_edit" else "刪除"
+        reply_message(event.reply_token,make_quick_reply_message(
+            f"長者：{patient['display_name']}\n請選擇要{verb}的行程：",items))
+        return True
+
+    if action == "family_calendar_reminder":
+        family = ensure_family_admin(user_id)
+        setting = get_followup_reminder_setting(patient_id,family["admin_user_id"])
+        payload["is_enabled"] = setting["is_enabled"]
+        set_operation_state(user_id,action,"calendar_reminder_setting",payload)
+        status = "已開啟" if setting["is_enabled"] else "未開啟"
+        reply_message(event.reply_token,make_quick_reply_message(
+            f"長者：{patient['display_name']}\n回診提醒目前：{status}\n"
+            f"預設於回診前 {setting['days_before']} 天 {setting['reminder_time']} 提醒。",
+            [
+                postback_item("開啟提醒","action=family_calendar_enable_reminder"),
+                postback_item("關閉提醒","action=family_calendar_disable_reminder"),
+                postback_item("取消","action=family_cancel"),
+            ]))
+        return True
+    return False
+
+
+def handle_family_calendar_postback(event,action,params):
+    user_id = get_user_id(event)
+    if not user_id:
+        reply_text(event.reply_token,"無法取得您的 LINE User ID。")
+        return True
+    family = ensure_family_admin(user_id)
+    family_id = family["id"]
+    admin_id = family["admin_user_id"]
+
+    if action in CALENDAR_ACTION_LABELS:
+        return send_calendar_patient_selection(event,user_id,action,family_id)
+
+    if action == "family_calendar_select_patient":
+        next_action = params.get("next_action",[None])[0]
+        patient_id = params.get("patient_id",[None])[0]
+        patient = get_family_patient(family_id,patient_id)
+        if not patient:
+            raise RuntimeError("找不到這位長者，或長者已不在此家庭")
+        if next_action not in CALENDAR_ACTION_LABELS:
+            raise RuntimeError("行事曆功能資料已逾時")
+        return handle_calendar_selected_patient(event,user_id,next_action,patient)
+
+    if action == "family_calendar_select_event":
+        state = get_operation_state(user_id)
+        payload = state.get("payload",{}) if state else {}
+        patient_id = payload.get("patient_id")
+        calendar_action = params.get("calendar_action",[None])[0]
+        event_id = params.get("event_id",[None])[0]
+        patient = get_family_patient(family_id,patient_id)
+        item = get_patient_calendar_event(patient_id,event_id) if patient else None
+        if not patient or not item:
+            raise RuntimeError("行程資料已逾時，請重新操作")
+        payload.update({"event_id":str(item["id"]),"event_title":item["title"]})
+
+        if calendar_action == "family_calendar_delete":
+            set_operation_state(user_id,calendar_action,"calendar_confirm_delete",payload)
+            reply_message(event.reply_token,make_quick_reply_message(
+                f"確定刪除以下行程？\n\n長者：{patient['display_name']}\n"
+                f"行程：{item['title']}\n時間：{item['starts_at'].strftime('%Y-%m-%d %H:%M')}",
+                [
+                    postback_item("確認刪除","action=family_calendar_confirm_delete"),
+                    postback_item("取消","action=family_cancel"),
+                ]))
+            return True
+
+        set_operation_state(user_id,"family_calendar_edit","calendar_select_edit_field",payload)
+        reply_message(event.reply_token,make_quick_reply_message(
+            f"行程：{item['title']}\n請選擇要修改的內容：",
+            [
+                postback_item("修改名稱","action=family_calendar_select_edit_field&field=title"),
+                postback_item("修改日期時間","action=family_calendar_select_edit_field&field=starts_at"),
+                postback_item("修改地點","action=family_calendar_select_edit_field&field=location"),
+                postback_item("取消","action=family_cancel"),
+            ]))
+        return True
+
+    if action == "family_calendar_select_edit_field":
+        state = get_operation_state(user_id)
+        payload = state.get("payload",{}) if state else {}
+        field = params.get("field",[None])[0]
+        if not payload.get("event_id"):
+            raise RuntimeError("修改資料已逾時，請重新操作")
+        if field == "starts_at":
+            payload["edit_field"] = field
+            set_operation_state(user_id,"family_calendar_edit","calendar_waiting_datetime",payload)
+            reply_message(event.reply_token,make_quick_reply_message(
+                "請點選新的日期與時間：",
+                [
+                    datetime_item("選擇日期時間",
+                        "action=family_calendar_save_datetime&mode=edit",
+                        mode="datetime",
+                        minimum=datetime.now().strftime("%Y-%m-%dT%H:%M")),
+                    postback_item("取消","action=family_cancel"),
+                ]))
+            return True
+        if field not in {"title","location"}:
+            raise RuntimeError("不支援的修改項目")
+        payload["edit_field"] = field
+        set_operation_state(user_id,"family_calendar_edit",f"waiting_calendar_edit_{field}",payload)
+        reply_text(event.reply_token,
+            ("請輸入新的行程名稱：" if field == "title" else "請輸入新的地點：")
+            + "\n輸入「取消」可結束。")
+        return True
+
+    if action == "family_calendar_save_datetime":
+        state = get_operation_state(user_id)
+        payload = state.get("payload",{}) if state else {}
+        dt_value = getattr(getattr(event.postback,"params",None),"datetime",None)
+        if not dt_value:
+            raise RuntimeError("沒有取得選擇的日期時間")
+        selected_dt = datetime.fromisoformat(dt_value)
+        mode = params.get("mode",[None])[0]
+
+        if mode == "add":
+            required = {"patient_id","calendar_title","calendar_location"}
+            if not required.issubset(payload):
+                raise RuntimeError("新增行程資料已逾時")
+            create_patient_calendar_event(
+                payload["patient_id"],payload["calendar_title"],
+                payload.get("calendar_description"),payload.get("calendar_location"),
+                selected_dt,admin_id)
+            clear_operation_state(user_id)
+            reply_text(event.reply_token,
+                f"行程新增完成！\n長者：{payload['patient_name']}\n"
+                f"行程：{payload['calendar_title']}\n"
+                f"時間：{selected_dt.strftime('%Y-%m-%d %H:%M')}\n"
+                f"地點：{payload.get('calendar_location') or '未填寫'}")
+            return True
+
+        if mode == "edit":
+            if not payload.get("event_id") or not payload.get("patient_id"):
+                raise RuntimeError("修改行程資料已逾時")
+            update_patient_calendar_event(
+                payload["event_id"],payload["patient_id"],"starts_at",selected_dt)
+            clear_operation_state(user_id)
+            reply_text(event.reply_token,
+                f"行程日期時間修改完成！\n行程：{payload['event_title']}\n"
+                f"新時間：{selected_dt.strftime('%Y-%m-%d %H:%M')}")
+            return True
+        raise RuntimeError("無法判斷日期時間操作")
+
+    if action == "family_calendar_confirm_delete":
+        state = get_operation_state(user_id)
+        payload = state.get("payload",{}) if state else {}
+        if not payload.get("event_id") or not payload.get("patient_id"):
+            raise RuntimeError("刪除資料已逾時")
+        delete_patient_calendar_event(payload["event_id"],payload["patient_id"])
+        clear_operation_state(user_id)
+        reply_text(event.reply_token,
+            f"已刪除行程：{payload.get('event_title') or '未命名行程'}")
+        return True
+
+    if action in {"family_calendar_enable_reminder","family_calendar_disable_reminder"}:
+        state = get_operation_state(user_id)
+        payload = state.get("payload",{}) if state else {}
+        patient_id = payload.get("patient_id")
+        if not patient_id or not get_family_patient(family_id,patient_id):
+            raise RuntimeError("提醒設定資料已逾時")
+        enabled = action == "family_calendar_enable_reminder"
+        save_followup_reminder_setting(
+            patient_id,admin_id,enabled,days_before=3,reminder_time="09:00")
+        clear_operation_state(user_id)
+        reply_text(event.reply_token,
+            f"{payload.get('patient_name','長者')}的回診提醒已{'開啟' if enabled else '關閉'}。"
+            + ("\n系統將在回診日前 3 天上午 09:00 排入通知。" if enabled else ""))
+        return True
+    return False
+
+
+
+
+# =========================================================
+# 家屬監控中心
+# =========================================================
+
+MONITOR_ACTIONS = {
+    "family_monitor_today_status": "今日狀態",
+    "family_monitor_missed": "漏服通知",
+    "family_monitor_emergency": "緊急通知",
+    "family_monitor_discomfort": "不舒服紀錄",
+    "family_monitor_adherence": "服藥率統計",
+}
+
+
+def get_patient_today_status(patient_id):
+    today = taipei_now().date()
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT ml.scheduled_at,ml.taken_at,ml.status::text,
+                   COALESCE(m.medication_name,'未命名藥物'),ml.note
+            FROM medication_logs ml
+            JOIN medications m ON m.id=ml.medication_id
+            WHERE ml.patient_id=%s
+              AND (ml.scheduled_at AT TIME ZONE 'Asia/Taipei')::date=%s
+            ORDER BY ml.scheduled_at
+            """,
+            (patient_id,today),
+        )
+        return [{
+            "scheduled_at":r[0],"taken_at":r[1],"status":r[2],
+            "medication_name":r[3],"note":r[4],
+        } for r in cursor.fetchall()]
+    finally:
+        connection.close()
+
+
+def family_today_status_text(patient):
+    rows = get_patient_today_status(patient["patient_id"])
+    if not rows:
+        return f"{patient['display_name']}今天尚無服藥紀錄。"
+    status_map = {
+        "scheduled":"待確認","taken":"已服藥","missed":"漏服",
+        "skipped":"略過","late":"延遲",
+    }
+    counts = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"],0) + 1
+    lines = [
+        f"{patient['display_name']}今日服藥狀態：",
+        "",
+        "統計：" + "、".join(
+            f"{status_map.get(k,k)} {v} 筆" for k,v in counts.items()
+        ),
+        "",
+        "明細：",
+    ]
+    for index,row in enumerate(rows,1):
+        scheduled = row["scheduled_at"].astimezone(TAIPEI_TZ).strftime("%H:%M")
+        taken = ""
+        if row["taken_at"]:
+            taken = "｜服藥 " + row["taken_at"].astimezone(TAIPEI_TZ).strftime("%H:%M")
+        lines.append(
+            f"{index}. {scheduled}｜{row['medication_name']}｜"
+            f"{status_map.get(row['status'],row['status'])}{taken}"
+        )
+    return "\n".join(lines)
+
+
+def family_missed_text(patient):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT ml.scheduled_at,ml.status::text,
+                   COALESCE(m.medication_name,'未命名藥物'),ml.note
+            FROM medication_logs ml
+            JOIN medications m ON m.id=ml.medication_id
+            WHERE ml.patient_id=%s
+              AND (
+                    ml.status::text='missed'
+                    OR (
+                        ml.status::text='scheduled'
+                        AND ml.scheduled_at < CURRENT_TIMESTAMP - INTERVAL '30 minutes'
+                    )
+              )
+              AND ml.scheduled_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+            ORDER BY ml.scheduled_at DESC
+            """,
+            (patient["patient_id"],),
+        )
+        rows = cursor.fetchall()
+    finally:
+        connection.close()
+    if not rows:
+        return f"{patient['display_name']}最近 7 天沒有漏服或逾時未確認紀錄。"
+    lines = [f"{patient['display_name']}最近 7 天的漏服通知："]
+    for index,row in enumerate(rows,1):
+        when = row[0].astimezone(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M")
+        status = "漏服" if row[1] == "missed" else "逾時未確認"
+        lines.append(f"{index}. {when}｜{row[2]}｜{status}")
+        if row[3]:
+            lines.append(f"   備註：{row[3]}")
+    return "\n".join(lines)
+
+
+def family_discomfort_text(patient):
+    records = list_patient_abnormal_reports(patient["patient_id"],days=None)
+    if not records:
+        return f"{patient['display_name']}目前沒有不舒服紀錄。"
+    lines = [f"{patient['display_name']}的不舒服紀錄："]
+    for index,record in enumerate(records[:30],1):
+        when = record["occurred_at"].astimezone(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M")
+        lines.extend([
+            "",
+            f"{index}. {when}｜{record.get('report_type') or '其他問題'}",
+            f"程度：{record.get('severity') or '未分級'}",
+            f"回報者：{record['reporter_name']}（{record['reporter_role']}）",
+            f"說明：{record.get('description') or '未填寫'}",
+        ])
+    return "\n".join(lines)
+
+
+def family_adherence_text(patient,days):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT status::text,COUNT(*)
+            FROM medication_logs
+            WHERE patient_id=%s
+              AND scheduled_at >= CURRENT_TIMESTAMP - (%s * INTERVAL '1 day')
+            GROUP BY status::text
+            """,
+            (patient["patient_id"],days),
+        )
+        counts = dict(cursor.fetchall())
+    finally:
+        connection.close()
+    total = sum(counts.values())
+    if total == 0:
+        return f"{patient['display_name']}最近 {days} 天沒有服藥紀錄。"
+    taken = counts.get("taken",0) + counts.get("late",0)
+    rate = round(taken / total * 100,1)
+    return (
+        f"{patient['display_name']}最近 {days} 天服藥率統計：\n\n"
+        f"總排程：{total} 筆\n"
+        f"已服藥：{counts.get('taken',0)} 筆\n"
+        f"延遲服藥：{counts.get('late',0)} 筆\n"
+        f"漏服：{counts.get('missed',0)} 筆\n"
+        f"略過：{counts.get('skipped',0)} 筆\n"
+        f"待確認：{counts.get('scheduled',0)} 筆\n\n"
+        f"服藥率：{rate}%"
+    )
+
+
+def upsert_family_emergency_contact(
+    patient_id,priority_order,contact_name,relationship,
+    phone_number,line_user_id=None,
+):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO emergency_contacts (
+                patient_id,contact_name,relationship,phone_number,
+                line_user_id,priority_order,is_active,updated_at
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,TRUE,CURRENT_TIMESTAMP)
+            ON CONFLICT (patient_id,priority_order)
+            DO UPDATE SET
+                contact_name=EXCLUDED.contact_name,
+                relationship=EXCLUDED.relationship,
+                phone_number=EXCLUDED.phone_number,
+                line_user_id=EXCLUDED.line_user_id,
+                is_active=TRUE,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (
+                patient_id,contact_name,relationship,phone_number,
+                line_user_id,priority_order,
+            ),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def send_monitor_patient_selection(event,user_id,action,family_id):
+    patients = list_family_patients(family_id)
+    if not patients:
+        reply_text(event.reply_token,"目前家庭尚未新增長者。")
+        return True
+    if len(patients) == 1:
+        return handle_monitor_selected_patient(event,user_id,action,patients[0])
+    set_operation_state(user_id,action,"monitor_select_patient",{})
+    items = [
+        postback_item(
+            p["display_name"],
+            f"action=family_monitor_select_patient&next_action={action}&patient_id={p['patient_id']}",
+            f"選擇 {p['display_name']}",
+        )
+        for p in patients[:12]
+    ]
+    reply_message(
+        event.reply_token,
+        make_quick_reply_message(
+            f"{MONITOR_ACTIONS[action]}\n請選擇長者：",items
+        ),
+    )
+    return True
+
+
+def handle_monitor_selected_patient(event,user_id,action,patient):
+    if action == "family_monitor_today_status":
+        reply_text(event.reply_token,family_today_status_text(patient))
+        return True
+    if action == "family_monitor_missed":
+        reply_text(event.reply_token,family_missed_text(patient))
+        return True
+    if action == "family_monitor_discomfort":
+        reply_text(event.reply_token,family_discomfort_text(patient))
+        return True
+    if action == "family_monitor_adherence":
+        set_operation_state(
+            user_id,action,"monitor_adherence_days",
+            {
+                "patient_id":str(patient["patient_id"]),
+                "patient_name":patient["display_name"],
+            },
+        )
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                f"請選擇 {patient['display_name']} 的統計期間：",
+                [
+                    postback_item("最近 7 天","action=family_monitor_adherence_7"),
+                    postback_item("最近 30 天","action=family_monitor_adherence_30"),
+                    postback_item("取消","action=family_cancel"),
+                ],
+            ),
+        )
+        return True
+    if action == "family_monitor_emergency":
+        contacts = list_elder_contacts(patient["patient_id"])
+        current = []
+        for i in range(2):
+            if i < len(contacts):
+                contact = contacts[i]
+                current.append(
+                    f"聯絡人 {i+1}：{contact['name']}｜"
+                    f"{contact.get('phone') or '未填電話'}"
+                )
+            else:
+                current.append(f"聯絡人 {i+1}：尚未設定")
+        set_operation_state(
+            user_id,action,"monitor_contact_select",
+            {
+                "patient_id":str(patient["patient_id"]),
+                "patient_name":patient["display_name"],
+            },
+        )
+        reply_message(
+            event.reply_token,
+            make_quick_reply_message(
+                (
+                    f"{patient['display_name']}的指定緊急聯絡人：\n"
+                    + "\n".join(current)
+                    + "\n\n請選擇要設定的位置："
+                ),
+                [
+                    postback_item(
+                        "設定聯絡人 1",
+                        "action=family_monitor_contact_select&priority=1",
+                    ),
+                    postback_item(
+                        "設定聯絡人 2",
+                        "action=family_monitor_contact_select&priority=2",
+                    ),
+                    postback_item("取消","action=family_cancel"),
+                ],
+            ),
+        )
+        return True
+    return False
+
+
+def handle_family_monitor_postback(event,action,params):
+    user_id = get_user_id(event)
+    family = ensure_family_admin(user_id)
+    family_id = family["id"]
+
+    if action in MONITOR_ACTIONS:
+        return send_monitor_patient_selection(event,user_id,action,family_id)
+
+    if action == "family_monitor_select_patient":
+        next_action = params.get("next_action",[None])[0]
+        patient_id = params.get("patient_id",[None])[0]
+        if next_action not in MONITOR_ACTIONS:
+            raise RuntimeError("監控功能資料已逾時")
+        patient = get_family_patient(family_id,patient_id)
+        if not patient:
+            raise RuntimeError("找不到這位長者")
+        return handle_monitor_selected_patient(event,user_id,next_action,patient)
+
+    if action in {"family_monitor_adherence_7","family_monitor_adherence_30"}:
+        state = get_operation_state(user_id)
+        payload = state.get("payload",{}) if state else {}
+        patient = get_family_patient(family_id,payload.get("patient_id"))
+        if not patient:
+            raise RuntimeError("統計資料已逾時")
+        days = 7 if action.endswith("_7") else 30
+        clear_operation_state(user_id)
+        reply_text(event.reply_token,family_adherence_text(patient,days))
+        return True
+
+    if action == "family_monitor_contact_select":
+        state = get_operation_state(user_id)
+        payload = state.get("payload",{}) if state else {}
+        priority = params.get("priority",[None])[0]
+        if not payload.get("patient_id") or priority not in {"1","2"}:
+            raise RuntimeError("聯絡人設定資料已逾時")
+        payload["priority"] = int(priority)
+        set_operation_state(
+            user_id,"family_monitor_emergency",
+            "waiting_monitor_contact_name",payload
+        )
+        reply_text(event.reply_token,f"請輸入緊急聯絡人 {priority} 的姓名：")
+        return True
+    return False
+
+# =========================================================
+# 家屬報表紀錄
+# =========================================================
+
+REPORT_ACTIONS = {
+    "family_report_today": ("今日紀錄", 1),
+    "family_report_7days": ("7天紀錄", 7),
+    "family_report_30days": ("30天紀錄", 30),
+    "family_report_abnormal": ("異常統計", None),
+    "family_report_summary": ("匯出摘要", 30),
+}
+
+
+def list_patient_medication_logs(patient_id, days):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                ml.scheduled_at,
+                ml.taken_at,
+                ml.status::text,
+                ml.note,
+                COALESCE(m.medication_name, '未命名藥物'),
+                COALESCE(u.display_name, '未記錄')
+            FROM medication_logs ml
+            LEFT JOIN medications m ON m.id = ml.medication_id
+            LEFT JOIN app_users u ON u.id = ml.reported_by
+            WHERE ml.patient_id = %s
+              AND ml.scheduled_at >= CURRENT_TIMESTAMP - (%s * INTERVAL '1 day')
+            ORDER BY ml.scheduled_at DESC
+            """,
+            (patient_id, days),
+        )
+        return [{
+            "scheduled_at": row[0],
+            "taken_at": row[1],
+            "status": row[2],
+            "note": row[3],
+            "medication_name": row[4],
+            "reported_by": row[5],
+        } for row in cursor.fetchall()]
+    finally:
+        connection.close()
+
+
+def list_patient_abnormal_reports(patient_id, days=None):
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                ar.id,
+                ar.report_type,
+                ar.severity,
+                ar.description,
+                ar.occurred_at,
+                ar.created_at,
+                COALESCE(u.display_name, '未知使用者'),
+                COALESCE(r.name_zh_tw, r.code, '未知身份')
+            FROM abnormal_reports ar
+            LEFT JOIN app_users u ON u.id = ar.reported_by
+            LEFT JOIN roles r ON r.id = u.role_id
+            WHERE ar.patient_id = %s
+              AND ar.is_active = TRUE
+              AND (%s IS NULL OR ar.occurred_at >= CURRENT_TIMESTAMP - (%s * INTERVAL '1 day'))
+            ORDER BY ar.occurred_at DESC, ar.created_at DESC
+            """,
+            (patient_id, days, days),
+        )
+        return [{
+            "id": row[0],
+            "report_type": row[1],
+            "severity": row[2],
+            "description": row[3],
+            "occurred_at": row[4],
+            "created_at": row[5],
+            "reporter_name": row[6],
+            "reporter_role": row[7],
+        } for row in cursor.fetchall()]
+    finally:
+        connection.close()
+
+
+def medication_log_report_text(patient, days):
+    logs = list_patient_medication_logs(patient["patient_id"], days)
+    title = "今日紀錄" if days == 1 else f"最近 {days} 天紀錄"
+
+    if not logs:
+        return f"{patient['display_name']}的{title}：\n目前沒有服藥紀錄。"
+
+    status_names = {
+        "scheduled": "待確認",
+        "taken": "已服藥",
+        "missed": "漏服",
+        "skipped": "略過",
+        "late": "延遲服藥",
+    }
+    counts = {}
+    for item in logs:
+        status = item["status"]
+        counts[status] = counts.get(status, 0) + 1
+
+    lines = [
+        f"{patient['display_name']}的{title}：",
+        "",
+        f"總紀錄：{len(logs)} 筆",
+        "狀態統計：" + "、".join(
+            f"{status_names.get(key, key)} {value} 筆"
+            for key, value in counts.items()
+        ),
+        "",
+        "紀錄明細：",
+    ]
+
+    for index, item in enumerate(logs[:30], 1):
+        scheduled = item["scheduled_at"].strftime("%Y-%m-%d %H:%M")
+        status = status_names.get(item["status"], item["status"])
+        lines.append(
+            f"{index}. {scheduled}｜{item['medication_name']}｜{status}"
+        )
+        if item.get("note"):
+            lines.append(f"   備註：{item['note']}")
+
+    if len(logs) > 30:
+        lines.append(f"\n其餘 {len(logs) - 30} 筆未顯示。")
+    return "\n".join(lines)
+
+
+def abnormal_report_text(patient):
+    records = list_patient_abnormal_reports(patient["patient_id"], days=None)
+    if not records:
+        return (
+            f"{patient['display_name']}目前沒有長者或看護回報的不舒服紀錄。"
+        )
+
+    severity_names = {
+        "mild": "輕微",
+        "moderate": "中等",
+        "severe": "嚴重",
+        "critical": "緊急",
+        "normal": "一般",
+    }
+    severity_count = {}
+    type_count = {}
+
+    for record in records:
+        severity = record.get("severity") or "未分級"
+        report_type = record.get("report_type") or "其他不舒服"
+        severity_count[severity] = severity_count.get(severity, 0) + 1
+        type_count[report_type] = type_count.get(report_type, 0) + 1
+
+    lines = [
+        f"{patient['display_name']}的不舒服紀錄統計：",
+        "",
+        f"總紀錄：{len(records)} 筆",
+        "程度統計：" + "、".join(
+            f"{severity_names.get(key, key)} {value} 筆"
+            for key, value in severity_count.items()
+        ),
+        "症狀統計：" + "、".join(
+            f"{key} {value} 筆"
+            for key, value in sorted(
+                type_count.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+        ),
+        "",
+        "所有不舒服紀錄：",
+    ]
+
+    for index, record in enumerate(records[:40], 1):
+        happened = record["occurred_at"].strftime("%Y-%m-%d %H:%M")
+        severity = severity_names.get(
+            record.get("severity"),
+            record.get("severity") or "未分級",
+        )
+        lines.extend([
+            (
+                f"{index}. {happened}｜"
+                f"{record.get('report_type') or '其他不舒服'}｜{severity}"
+            ),
+            (
+                f"   回報者：{record['reporter_name']}"
+                f"（{record['reporter_role']}）"
+            ),
+            f"   說明：{record.get('description') or '未填寫'}",
+        ])
+
+    if len(records) > 40:
+        lines.append(f"\n其餘 {len(records) - 40} 筆未顯示。")
+    return "\n".join(lines)
+
+
+def patient_medical_summary_text(patient):
+    medications = list_patient_medications(
+        patient["patient_id"],
+        active_only=True,
+    )
+    abnormal_records = list_patient_abnormal_reports(
+        patient["patient_id"],
+        days=None,
+    )
+
+    lines = [
+        "【長者用藥與不舒服摘要】",
+        f"長者：{patient['display_name']}",
+        f"產生時間：{datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "一、目前使用中的藥物",
+    ]
+
+    if not medications:
+        lines.append("目前沒有使用中的藥物。")
+    else:
+        for index, medication in enumerate(medications, 1):
+            inventory = _medication_inventory_values(medication)
+            lines.extend([
+                "",
+                f"{index}. {medication['medication_name']}",
+                f"含量：{medication.get('dosage') or '未標示'}",
+                f"用法：{medication.get('instructions') or '未標示'}",
+                f"調劑日期：{inventory['dispense_date'] or '未標示'}",
+                f"處方天數：{inventory['course_days'] or '未標示'}",
+                (
+                    "剩餘量："
+                    f"{_format_quantity(inventory['remaining'])} "
+                    f"{medication['quantity_unit']}"
+                ),
+            ])
+
+    lines.extend(["", "二、長者／看護回報的不舒服紀錄"])
+
+    if not abnormal_records:
+        lines.append("目前沒有不舒服紀錄。")
+    else:
+        for index, record in enumerate(abnormal_records[:30], 1):
+            happened = record["occurred_at"].strftime("%Y-%m-%d %H:%M")
+            lines.extend([
+                "",
+                (
+                    f"{index}. {happened}｜"
+                    f"{record.get('report_type') or '其他不舒服'}"
+                ),
+                (
+                    f"回報者：{record['reporter_name']}"
+                    f"（{record['reporter_role']}）"
+                ),
+                f"程度：{record.get('severity') or '未分級'}",
+                f"說明：{record.get('description') or '未填寫'}",
+            ])
+
+        if len(abnormal_records) > 30:
+            lines.append(
+                f"\n其餘 {len(abnormal_records) - 30} 筆未顯示。"
+            )
+
+    lines.extend([
+        "",
+        "此摘要僅整理系統內已有紀錄，不能替代醫師診斷。",
+    ])
+    return "\n".join(lines)
+
+
+def send_report_patient_selection(event, user_id, action, family_id):
+    patients = list_family_patients(family_id)
+    if not patients:
+        reply_text(
+            event.reply_token,
+            "目前家庭尚未新增長者，請先到「家庭管理」新增長者。",
+        )
+        return True
+
+    if len(patients) == 1:
+        return handle_report_selected_patient(
+            event,
+            user_id,
+            action,
+            patients[0],
+        )
+
+    set_operation_state(
+        user_id,
+        action,
+        "report_select_patient",
+        {},
+    )
+    items = [
+        postback_item(
+            patient["display_name"],
+            (
+                "action=family_report_select_patient"
+                f"&next_action={action}"
+                f"&patient_id={patient['patient_id']}"
+            ),
+            f"選擇 {patient['display_name']}",
+        )
+        for patient in patients[:12]
+    ]
+    reply_message(
+        event.reply_token,
+        make_quick_reply_message(
+            f"{REPORT_ACTIONS[action][0]}\n請選擇長者：",
+            items,
+        ),
+    )
+    return True
+
+
+def handle_report_selected_patient(event, user_id, action, patient):
+    clear_operation_state(user_id)
+
+    if action in {
+        "family_report_today",
+        "family_report_7days",
+        "family_report_30days",
+    }:
+        days = REPORT_ACTIONS[action][1]
+        reply_text(
+            event.reply_token,
+            medication_log_report_text(patient, days),
+        )
+        return True
+
+    if action == "family_report_abnormal":
+        reply_text(
+            event.reply_token,
+            abnormal_report_text(patient),
+        )
+        return True
+
+    if action == "family_report_summary":
+        reply_text(
+            event.reply_token,
+            patient_medical_summary_text(patient),
+        )
+        return True
+
+    return False
+
+
+def handle_family_report_postback(event, action, params):
+    user_id = get_user_id(event)
+    if not user_id:
+        reply_text(event.reply_token, "無法取得您的 LINE User ID。")
+        return True
+
+    family = ensure_family_admin(user_id)
+    family_id = family["id"]
+
+    if action in REPORT_ACTIONS:
+        return send_report_patient_selection(
+            event,
+            user_id,
+            action,
+            family_id,
+        )
+
+    if action == "family_report_select_patient":
+        next_action = params.get("next_action", [None])[0]
+        patient_id = params.get("patient_id", [None])[0]
+
+        if next_action not in REPORT_ACTIONS:
+            raise RuntimeError("報表功能資料已逾時")
+
+        patient = get_family_patient(family_id, patient_id)
+        if not patient:
+            raise RuntimeError("找不到這位長者，或長者已不在此家庭")
+
+        return handle_report_selected_patient(
+            event,
+            user_id,
+            next_action,
+            patient,
+        )
+
+    return False
 
 # =========================================================
 # OpenAI
@@ -1438,6 +4643,73 @@ def handle_text_message(event):
             )
             return
 
+
+        if user_id:
+            elder_state = get_operation_state(user_id)
+            if elder_state:
+                if user_text in {"取消", "cancel", "Cancel"}:
+                    clear_operation_state(user_id)
+                    reply_text(event.reply_token, "已取消本次操作。")
+                    return
+
+                step = elder_state.get("step")
+                payload = elder_state.get("payload", {})
+
+                if step == "waiting_elder_discomfort_text":
+                    patient = get_elder_patient_by_line_user_id(user_id)
+                    save_elder_discomfort(
+                        patient,
+                        patient["user_id"],
+                        "其他問題",
+                        user_text,
+                    )
+                    clear_operation_state(user_id)
+                    reply_text(
+                        event.reply_token,
+                        "已記錄目前不舒服的情況，家屬端可在異常統計中查看。",
+                    )
+                    return
+
+                if step == "waiting_elder_calendar_title":
+                    payload["calendar_title"] = user_text[:255]
+                    set_operation_state(
+                        user_id,
+                        "elder_calendar_add",
+                        "waiting_elder_calendar_location",
+                        payload,
+                    )
+                    reply_text(
+                        event.reply_token,
+                        "請輸入地點，例如：埔里基督教醫院。沒有地點請輸入「未填寫」。",
+                    )
+                    return
+
+                if step == "waiting_elder_calendar_location":
+                    payload["calendar_location"] = (
+                        None if user_text in {"未填寫", "無", "沒有"} else user_text[:500]
+                    )
+                    set_operation_state(
+                        user_id,
+                        "elder_calendar_add",
+                        "waiting_elder_calendar_datetime",
+                        payload,
+                    )
+                    reply_message(
+                        event.reply_token,
+                        make_quick_reply_message(
+                            "請選擇日期與時間：",
+                            [
+                                datetime_item(
+                                    "選擇日期時間",
+                                    "action=elder_calendar_save_datetime&mode=add",
+                                    mode="datetime",
+                                    minimum=taipei_now().strftime("%Y-%m-%dT%H:%M"),
+                                ),
+                                postback_item("取消", "action=elder_cancel"),
+                            ],
+                        ),
+                    )
+                    return
         answer = gpt_response(
             user_text
         )
@@ -1495,9 +4767,49 @@ def handle_image_message(event):
         finally:
             api_client.close()
 
+
+        state = get_operation_state(user_id) if user_id else None
+        if state and state.get("step") == "waiting_elder_prescription_image":
+            patient = get_elder_patient_by_line_user_id(user_id)
+            connection = get_db_connection()
+            try:
+                cursor = connection.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO ai_medication_scans (
+                        patient_id,
+                        uploaded_by,
+                        line_message_id,
+                        image_path,
+                        processing_status,
+                        created_at
+                    )
+                    VALUES (%s,%s,%s,%s,'uploaded',CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        patient["patient_id"],
+                        patient["user_id"],
+                        event.message.id,
+                        image_path,
+                    ),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+            clear_operation_state(user_id)
+            reply_text(
+                event.reply_token,
+                "藥單圖片已上傳並保存，家屬可在「藥袋紀錄」中查看。",
+            )
+            return
+
         reply_text(
             event.reply_token,
-            "已收到藥袋圖片，接下來會進行 AI 辨識。",
+            "已收到圖片。",
         )
 
     except Exception:
@@ -1532,6 +4844,10 @@ def handle_postback(event):
             "role",
             [None],
         )[0]
+
+        if action in ELDER_MEDICATION_ACTIONS:
+            if handle_elder_medication_postback(event, action, params):
+                return
 
         if action in FAMILY_ACTIONS:
             if handle_family_postback(event, action, params):
