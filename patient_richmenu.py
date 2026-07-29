@@ -4,7 +4,68 @@ from richmenu_common import create_rich_menu_set
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-IMAGE_DIR = os.path.join(BASE_DIR, "static", "paitent")
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+
+
+def find_patient_image_dir():
+    target_image = "elder_main_menu.jpg"
+    matched_dirs = []
+
+    if not os.path.isdir(STATIC_DIR):
+        raise FileNotFoundError(
+            f"找不到 static 資料夾：{STATIC_DIR}"
+        )
+
+    for current_dir, _, filenames in os.walk(STATIC_DIR):
+        if target_image in filenames:
+            matched_dirs.append(current_dir)
+
+    if not matched_dirs:
+        raise FileNotFoundError(
+            "在 static 資料夾內找不到 "
+            f"{target_image}。\n"
+            "請確認長者圖片已提交到 GitHub，"
+            "並且 Render 已重新部署最新版本。"
+        )
+
+    if len(matched_dirs) > 1:
+        raise RuntimeError(
+            "找到多個長者圖片資料夾，無法判斷應使用哪一個：\n- "
+            + "\n- ".join(matched_dirs)
+        )
+
+    selected_dir = matched_dirs[0]
+
+    required_images = [
+        "elder_main_menu.jpg",
+        "elder_today_medication_menu.jpg",
+        "elder_my_medication_menu.jpg",
+        "elder_medication_report_menu.jpg",
+        "elder_discomfort_menu.jpg",
+        "elder_calendar_menu.jpg",
+        "elder_sos_menu.jpg",
+    ]
+
+    missing_images = [
+        filename
+        for filename in required_images
+        if not os.path.isfile(
+            os.path.join(selected_dir, filename)
+        )
+    ]
+
+    if missing_images:
+        raise FileNotFoundError(
+            f"長者圖片資料夾：{selected_dir}\n"
+            "但缺少以下圖片：\n- "
+            + "\n- ".join(missing_images)
+        )
+
+    print(f"[elderly] 使用圖片資料夾：{selected_dir}")
+    return selected_dir
+
+
+IMAGE_DIR = find_patient_image_dir()
 
 
 MENU_DEFINITIONS = {
@@ -16,7 +77,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "查看更多資訊",
             "areas": [
                 {
-                    "bounds": {"x": 35, "y": 251, "width": 798, "height": 665},
+                    "bounds": {"x": 0, "y": 0, "width": 833, "height": 843},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_today_medication",
@@ -24,7 +85,7 @@ MENU_DEFINITIONS = {
                     },
                 },
                 {
-                    "bounds": {"x": 855, "y": 251, "width": 827, "height": 671},
+                    "bounds": {"x": 834, "y": 0, "width": 833, "height": 843},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_my_medication",
@@ -32,7 +93,7 @@ MENU_DEFINITIONS = {
                     },
                 },
                 {
-                    "bounds": {"x": 1701, "y": 254, "width": 772, "height": 665},
+                    "bounds": {"x": 1663, "y": 0, "width": 837, "height": 843},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_medication_report",
@@ -40,7 +101,7 @@ MENU_DEFINITIONS = {
                     },
                 },
                 {
-                    "bounds": {"x": 38, "y": 935, "width": 792, "height": 740},
+                    "bounds": {"x": 0, "y": 843, "width": 833, "height": 843},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_discomfort",
@@ -48,7 +109,7 @@ MENU_DEFINITIONS = {
                     },
                 },
                 {
-                    "bounds": {"x": 852, "y": 941, "width": 826, "height": 741},
+                    "bounds": {"x": 834, "y": 843, "width": 833, "height": 843},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_calendar",
@@ -56,7 +117,7 @@ MENU_DEFINITIONS = {
                     },
                 },
                 {
-                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
+                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_sos",
@@ -76,13 +137,58 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
+                    "bounds": {"x": 0, "y": 0, "width": 833, "height": 843},
+                    "action": {
+                        "type": "postback",
+                        "label": "早餐藥物",
+                        "data": "action=elder_today_breakfast",
+                        "displayText": "早餐藥物",
+                    },
+                },
+                {
+                    "bounds": {"x": 834, "y": 0, "width": 833, "height": 843},
+                    "action": {
+                        "type": "postback",
+                        "label": "午餐藥物",
+                        "data": "action=elder_today_lunch",
+                        "displayText": "午餐藥物",
+                    },
+                },
+                {
+                    "bounds": {"x": 1663, "y": 0, "width": 837, "height": 843},
+                    "action": {
+                        "type": "postback",
+                        "label": "晚餐藥物",
+                        "data": "action=elder_today_dinner",
+                        "displayText": "晚餐藥物",
+                    },
+                },
+                {
+                    "bounds": {"x": 0, "y": 843, "width": 833, "height": 843},
+                    "action": {
+                        "type": "postback",
+                        "label": "睡前藥物",
+                        "data": "action=elder_today_bedtime",
+                        "displayText": "睡前藥物",
+                    },
+                },
+                {
+                    "bounds": {"x": 834, "y": 843, "width": 833, "height": 843},
+                    "action": {
+                        "type": "postback",
+                        "label": "今日全部",
+                        "data": "action=elder_today_all",
+                        "displayText": "今日全部",
+                    },
+                },
+                {
+                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_main",
                         "data": "switch-to-elder-main",
                     },
-                }
+                },
             ],
         },
         "image": "elder_today_medication_menu.jpg",
@@ -92,17 +198,62 @@ MENU_DEFINITIONS = {
         "menu": {
             "size": {"width": 2500, "height": 1686},
             "selected": True,
-            "name": "長者我的藥物",
+            "name": "長者我已服藥",
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
+                    "bounds": {"x": 0, "y": 0, "width": 833, "height": 843},
+                    "action": {
+                        "type": "postback",
+                        "label": "早餐已服",
+                        "data": "action=elder_taken_breakfast",
+                        "displayText": "早餐已服",
+                    },
+                },
+                {
+                    "bounds": {"x": 834, "y": 0, "width": 833, "height": 843},
+                    "action": {
+                        "type": "postback",
+                        "label": "午餐已服",
+                        "data": "action=elder_taken_lunch",
+                        "displayText": "午餐已服",
+                    },
+                },
+                {
+                    "bounds": {"x": 1663, "y": 0, "width": 837, "height": 843},
+                    "action": {
+                        "type": "postback",
+                        "label": "晚餐已服",
+                        "data": "action=elder_taken_dinner",
+                        "displayText": "晚餐已服",
+                    },
+                },
+                {
+                    "bounds": {"x": 0, "y": 843, "width": 833, "height": 843},
+                    "action": {
+                        "type": "postback",
+                        "label": "睡前已服",
+                        "data": "action=elder_taken_bedtime",
+                        "displayText": "睡前已服",
+                    },
+                },
+                {
+                    "bounds": {"x": 834, "y": 843, "width": 833, "height": 843},
+                    "action": {
+                        "type": "postback",
+                        "label": "今日紀錄",
+                        "data": "action=elder_taken_today",
+                        "displayText": "今日紀錄",
+                    },
+                },
+                {
+                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_main",
                         "data": "switch-to-elder-main",
                     },
-                }
+                },
             ],
         },
         "image": "elder_my_medication_menu.jpg",
@@ -116,7 +267,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
+                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_main",
@@ -136,7 +287,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
+                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_main",
@@ -156,7 +307,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1698, "y": 935, "width": 775, "height": 744},
+                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_main",
@@ -176,7 +327,7 @@ MENU_DEFINITIONS = {
             "chatBarText": "返回主選單",
             "areas": [
                 {
-                    "bounds": {"x": 1259, "y": 938, "width": 1208, "height": 734},
+                    "bounds": {"x": 1663, "y": 843, "width": 837, "height": 843},
                     "action": {
                         "type": "richmenuswitch",
                         "richMenuAliasId": "elder_main",
