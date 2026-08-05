@@ -4,6 +4,7 @@ import json
 import traceback
 import math
 import re
+import uuid
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
@@ -213,6 +214,20 @@ def init_database():
                 "新版 PostgreSQL 架構尚未完成，缺少資料表："
                 + ", ".join(missing_tables)
             )
+
+        # Persist the patient currently selected by each caregiver.  This is
+        # intentionally independent of temporary conversation state.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS caregiver_selected_patients (
+                caregiver_user_id UUID PRIMARY KEY REFERENCES app_users(id),
+                patient_id UUID NOT NULL REFERENCES patients(id),
+                selected_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.commit()
 
     finally:
         connection.close()
@@ -704,16 +719,16 @@ def create_role_selection_message():
                 ),
                 QuickReplyItem(
                     action=PostbackAction(
-                        label="看護",
-                        data="action=select_role&role=caregiver",
-                        display_text="我是看護",
+                        label="長者",
+                        data="action=select_role&role=elderly",
+                        display_text="我是長者",
                     )
                 ),
                 QuickReplyItem(
                     action=PostbackAction(
-                        label="長者",
-                        data="action=select_role&role=elderly",
-                        display_text="我是長者",
+                        label="看護",
+                        data="action=select_role&role=caregiver",
+                        display_text="我是看護",
                     )
                 ),
             ]
@@ -2205,6 +2220,334 @@ def handle_elder_extended_postback(event, action, params):
         return True
 
     return False
+
+# =========================================================
+# 看護功能：選擇長者、任務、用藥、行事曆、異常與 SOS
+# =========================================================
+
+CAREGIVER_ACTIONS = {
+    "caregiver_select_patient", "caregiver_emergency", "caregiver_tasks",
+    "caregiver_medication_schedule", "caregiver_medication_plan",
+    "caregiver_medication_records", "caregiver_medication_summary",
+    "caregiver_calendar", "caregiver_prescription_details",
+    "caregiver_recognition_result", "caregiver_medication_warnings",
+    "caregiver_report_issue", "caregiver_sos_contact",
+    "caregiver_sos_notify_all",
+}
+
+CAREGIVER_SLOT_LABELS = {
+    "breakfast": "Morning", "lunch": "Noon/Afternoon",
+    "dinner": "Evening", "bedtime": "Bedtime", "prn": "PRN",
+}
+
+
+def _caregiver_user(line_user_id):
+    user = get_app_user_by_line_id(line_user_id)
+    if not user or user.get("role") != "caregiver":
+        raise RuntimeError("This function is available to caregivers only.")
+    return user
+
+
+def list_caregiver_patients(line_user_id):
+    caregiver = _caregiver_user(line_user_id)
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT p.id, COALESCE(NULLIF(p.full_name,''), NULLIF(e.display_name,''), 'Patient'),
+                   p.linked_user_id, e.line_user_id
+            FROM caregiver_patient_assignments cpa
+            JOIN app_users e ON e.id=cpa.elder_user_id AND e.is_active=TRUE
+            JOIN patients p ON p.linked_user_id=e.id AND p.is_active=TRUE
+            WHERE cpa.caregiver_user_id=%s AND cpa.is_active=TRUE
+            ORDER BY cpa.created_at, p.created_at
+            """,
+            (caregiver["id"],),
+        )
+        return [{"patient_id": r[0], "patient_name": r[1],
+                 "user_id": r[2], "line_user_id": r[3]} for r in cursor.fetchall()]
+    finally:
+        connection.close()
+
+
+def select_caregiver_patient(line_user_id, slot):
+    caregiver = _caregiver_user(line_user_id)
+    patients = list_caregiver_patients(line_user_id)
+    try:
+        index = int(slot) - 1
+    except (TypeError, ValueError):
+        index = -1
+    if index < 0 or index >= len(patients):
+        raise RuntimeError(
+            f"Patient {slot} has not been assigned to you. "
+            "Please ask the family account to assign this patient first."
+        )
+    patient = patients[index]
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO caregiver_selected_patients (caregiver_user_id,patient_id)
+            VALUES (%s,%s)
+            ON CONFLICT (caregiver_user_id) DO UPDATE SET
+                patient_id=EXCLUDED.patient_id,
+                selected_at=CURRENT_TIMESTAMP,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (caregiver["id"], patient["patient_id"]),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return patient
+
+
+def get_selected_caregiver_patient(line_user_id, required=True):
+    caregiver = _caregiver_user(line_user_id)
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT p.id, COALESCE(NULLIF(p.full_name,''),NULLIF(e.display_name,''),'Patient'),
+                   p.linked_user_id, e.line_user_id
+            FROM caregiver_selected_patients selected
+            JOIN patients p ON p.id=selected.patient_id AND p.is_active=TRUE
+            JOIN app_users e ON e.id=p.linked_user_id AND e.is_active=TRUE
+            JOIN caregiver_patient_assignments cpa
+              ON cpa.caregiver_user_id=selected.caregiver_user_id
+             AND cpa.elder_user_id=p.linked_user_id AND cpa.is_active=TRUE
+            WHERE selected.caregiver_user_id=%s
+            """,
+            (caregiver["id"],),
+        )
+        row = cursor.fetchone()
+        if row:
+            return {"patient_id": row[0], "patient_name": row[1],
+                    "user_id": row[2], "line_user_id": row[3]}
+    finally:
+        connection.close()
+    if required:
+        raise RuntimeError("Please select a patient first.")
+    return None
+
+
+def link_rich_menu_alias(user_id, alias_id):
+    response = requests.get(
+        f"https://api.line.me/v2/bot/richmenu/alias/{alias_id}",
+        headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"}, timeout=20,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Cannot load Rich Menu alias {alias_id}: HTTP {response.status_code}")
+    rich_menu_id = response.json().get("richMenuId")
+    link_rich_menu(user_id, rich_menu_id)
+    return rich_menu_id
+
+
+def caregiver_plan_text(patient, slot=None):
+    medications = list_elder_today_medications(patient["patient_id"], None if slot == "prn" else slot)
+    if slot == "prn":
+        medications = [m for m in medications if m.get("meal_slot") == "prn" or
+                       re.search(r"\b(PRN|需要時|必要時)\b", m.get("instructions") or "", re.I)]
+    if not medications:
+        return f"{patient['patient_name']}\nNo {CAREGIVER_SLOT_LABELS.get(slot, 'scheduled')} medication found."
+    lines = [f"{patient['patient_name']} – {CAREGIVER_SLOT_LABELS.get(slot, 'Medication Schedule')}"]
+    for index, item in enumerate(medications, 1):
+        when = item.get("schedule_time")
+        when_text = when.strftime("%H:%M") if hasattr(when, "strftime") else str(when or "Time not set")
+        dose = item.get("dose_amount") or item.get("dosage") or "Not specified"
+        lines.extend(["", f"{index}. {item['medication_name']}",
+                      f"Time: {when_text}", f"Dose: {dose}",
+                      f"Directions: {item.get('instructions') or item.get('meal_relation') or 'Not specified'}"])
+    return "\n".join(lines)
+
+
+def caregiver_records_text(patient, period):
+    conditions = {
+        "today": "(ml.scheduled_at AT TIME ZONE 'Asia/Taipei')::date=CURRENT_DATE",
+        "7days": "ml.scheduled_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'",
+        "late": "ml.status::text='taken' AND ml.taken_at > ml.scheduled_at + INTERVAL '30 minutes'",
+        "missed": "ml.status::text='missed' OR (ml.status::text='scheduled' AND ml.scheduled_at < CURRENT_TIMESTAMP - INTERVAL '30 minutes')",
+    }
+    condition = conditions.get(period, conditions["today"])
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            f"""
+            SELECT m.medication_name,ml.status::text,ml.scheduled_at,ml.taken_at,
+                   COALESCE(ms.dose_amount,m.dose_per_time),m.quantity_unit
+            FROM medication_logs ml
+            JOIN medications m ON m.id=ml.medication_id
+            LEFT JOIN medication_schedules ms ON ms.id=ml.schedule_id
+            WHERE ml.patient_id=%s AND ({condition})
+            ORDER BY ml.scheduled_at DESC LIMIT 50
+            """,
+            (patient["patient_id"],),
+        )
+        rows = cursor.fetchall()
+    finally:
+        connection.close()
+    if not rows:
+        return f"{patient['patient_name']}\nNo matching medication records."
+    labels = {"today": "Today's Records", "7days": "Last 7 Days", "late": "Late Records", "missed": "Missed Records"}
+    lines = [f"{patient['patient_name']} – {labels.get(period, 'Medication Records')}"]
+    for name, status, scheduled, taken, dose, unit in rows:
+        local_time = scheduled.astimezone(TAIPEI_TZ).strftime("%m-%d %H:%M") if scheduled else "Time not set"
+        lines.append(f"• {local_time} | {name} | {dose or '-'} {unit or ''} | {status}")
+    return "\n".join(lines)
+
+
+def caregiver_calendar_text(patient, event_type):
+    events = list_patient_calendar_events(patient["patient_id"], upcoming_only=True)
+    if event_type == "reminders":
+        limit_date = taipei_now() + timedelta(days=3)
+        events = [e for e in events if e.get("starts_at") and e["starts_at"] <= limit_date]
+    elif event_type == "temporary":
+        events = [e for e in events if e.get("event_type") in {"temporary", "temporary_appointment"}]
+    elif event_type != "other":
+        events = [e for e in events if e.get("event_type") == event_type]
+    else:
+        events = [e for e in events if e.get("event_type") not in {"hospital_visit", "medication_pickup", "temporary", "temporary_appointment"}]
+    if not events:
+        return f"{patient['patient_name']}\nNo matching upcoming calendar events."
+    lines = [f"{patient['patient_name']} – Upcoming Calendar"]
+    for item in events:
+        starts = item["starts_at"].astimezone(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M")
+        lines.extend(["", f"• {item['title']}", f"  {starts}", f"  {item.get('location') or 'Location not set'}"])
+    return "\n".join(lines)
+
+
+def caregiver_prescription_text(patient, mode):
+    records = list_medication_bag_records(patient["patient_id"], limit=1)
+    if not records:
+        return f"{patient['patient_name']} has no prescription scan records."
+    record = records[0]
+    if mode == "recognition":
+        content = record.get("parsed_result") or record.get("original_text")
+        if isinstance(content, (dict, list)):
+            content = json.dumps(content, ensure_ascii=False, indent=2)
+        return f"{patient['patient_name']} – Recognition Result\n\n{content or 'Recognition is not complete yet.'}"
+    created = record["created_at"].astimezone(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M")
+    return (f"{patient['patient_name']} – Latest Prescription\n"
+            f"Uploaded: {created}\nUploader: {record['uploader_name']} ({record['uploader_role']})\n"
+            f"Status: {record['status'] or 'unknown'}")
+
+
+def save_caregiver_issue(patient, reported_by, issue_type, description=None):
+    labels = {"refuse_service": "Refuse Service", "body_discomfort": "Body Discomfort",
+              "vomiting": "Vomiting", "missing_medication": "Missing Medication", "other": "Other Issue"}
+    severity = "urgent" if issue_type == "vomiting" else "moderate"
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """INSERT INTO abnormal_reports
+               (patient_id,reported_by,report_type,severity,description,occurred_at,is_active)
+               VALUES (%s,%s,%s,%s,%s,%s,TRUE)""",
+            (patient["patient_id"], reported_by, labels.get(issue_type, issue_type),
+             severity, description or labels.get(issue_type, issue_type), taipei_now()),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback(); raise
+    finally:
+        connection.close()
+    return labels.get(issue_type, issue_type)
+
+
+def handle_caregiver_postback(event, action, params):
+    user_id = get_user_id(event)
+    caregiver = _caregiver_user(user_id)
+    if action == "caregiver_select_patient":
+        slot = params.get("slot", [None])[0]
+        patient = select_caregiver_patient(user_id, slot)
+        link_rich_menu_alias(user_id, "caregiver_patient1_main")
+        reply_text(event.reply_token, f"Selected: {patient['patient_name']}\nThe patient menu is now ready.")
+        return True
+
+    patient = get_selected_caregiver_patient(user_id, required=False)
+    if action == "caregiver_emergency" and not patient:
+        patients = list_caregiver_patients(user_id)
+        if len(patients) == 1:
+            patient = select_caregiver_patient(user_id, 1)
+        else:
+            reply_text(event.reply_token, "Please select a patient before using Emergency.")
+            return True
+    if not patient:
+        reply_text(event.reply_token, "Please select a patient first.")
+        return True
+    if action == "caregiver_emergency":
+        link_rich_menu_alias(user_id, "caregiver_patient1_sos")
+        reply_text(event.reply_token, f"Emergency contacts for {patient['patient_name']} are ready.")
+    elif action in {"caregiver_tasks", "caregiver_medication_plan"}:
+        reply_text(event.reply_token, caregiver_plan_text(patient, params.get("slot", [None])[0]))
+    elif action == "caregiver_medication_schedule":
+        reply_text(event.reply_token, caregiver_plan_text(patient))
+    elif action == "caregiver_medication_records":
+        reply_text(event.reply_token, caregiver_records_text(patient, params.get("period", ["today"])[0]))
+    elif action == "caregiver_medication_summary":
+        summary_patient = {"display_name": patient["patient_name"]}
+        reply_text(event.reply_token, medication_summary_text(summary_patient, list_patient_medications(patient["patient_id"], True)))
+    elif action == "caregiver_calendar":
+        reply_text(event.reply_token, caregiver_calendar_text(patient, params.get("type", ["other"])[0]))
+    elif action == "caregiver_prescription_details":
+        reply_text(event.reply_token, caregiver_prescription_text(patient, "details"))
+    elif action == "caregiver_recognition_result":
+        reply_text(event.reply_token, caregiver_prescription_text(patient, "recognition"))
+    elif action == "caregiver_medication_warnings":
+        medications = list_patient_medications(patient["patient_id"], True)
+        lines = [f"{patient['patient_name']} – Medication Warnings"]
+        for medication in medications:
+            lines.append(f"• {medication['medication_name']}: {medication.get('instructions') or 'No warning recorded'}")
+        reply_text(event.reply_token, "\n".join(lines) if medications else f"{patient['patient_name']} has no active medications.")
+    elif action == "caregiver_report_issue":
+        issue_type = params.get("type", ["other"])[0]
+        if issue_type in {"body_discomfort", "other"}:
+            set_operation_state(user_id, "caregiver_report_issue", "waiting_caregiver_issue_text",
+                                {"patient_id": str(patient["patient_id"]), "issue_type": issue_type})
+            reply_text(event.reply_token, "Please describe the issue. The current time will be recorded automatically.\nType Cancel to stop.")
+        else:
+            label = save_caregiver_issue(patient, caregiver["id"], issue_type)
+            reply_text(event.reply_token, f"Recorded: {label}\nTime: {taipei_now().strftime('%Y-%m-%d %H:%M')}")
+    elif action == "caregiver_sos_contact":
+        contacts = list_elder_contacts(patient["patient_id"])
+        number = int(params.get("contact", ["1"])[0])
+        if len(contacts) < number:
+            reply_text(event.reply_token, f"Emergency Contact {number} has not been set by the family.")
+        else:
+            contact = contacts[number - 1]
+            message = (f"EMERGENCY: {patient['patient_name']} needs assistance.\n"
+                       f"Reported by caregiver at {taipei_now().strftime('%Y-%m-%d %H:%M')}.")
+            sent = failed = 0
+            if contact.get("line_user_id"):
+                api_client, messaging_api = get_messaging_api()
+                try:
+                    messaging_api.push_message(
+                        PushMessageRequest(
+                            to=contact["line_user_id"],
+                            messages=[TextMessage(text=safe_text(message))],
+                        )
+                    )
+                    sent = 1
+                except Exception:
+                    failed = 1
+                    app.logger.error(traceback.format_exc())
+                finally:
+                    api_client.close()
+            reply_text(event.reply_token, f"Contact {number}: {contact['name']} ({contact['relationship']})\nPhone: {contact.get('phone') or 'Not set'}\nNotification sent: {sent}; failed: {failed}")
+    elif action == "caregiver_sos_notify_all":
+        message = (f"EMERGENCY: {patient['patient_name']} needs immediate assistance.\n"
+                   f"Caregiver notification time: {taipei_now().strftime('%Y-%m-%d %H:%M')}.")
+        sent, failed = notify_elder_family(patient, message)
+        reply_text(event.reply_token, f"Emergency notification complete.\nSent: {sent}; failed: {failed}")
+    return True
+
 
 # =========================================================
 # 家庭管理功能
@@ -4908,6 +5251,26 @@ def handle_text_message(event):
             if handle_family_text_input(event, user_text, user_id):
                 return
 
+        if user_id and user and user.get("role") == "caregiver":
+            caregiver_state = get_operation_state(user_id)
+            if caregiver_state and caregiver_state.get("step") == "waiting_caregiver_issue_text":
+                payload = caregiver_state.get("payload", {})
+                patient = get_selected_caregiver_patient(user_id)
+                if str(patient["patient_id"]) != str(payload.get("patient_id")):
+                    clear_operation_state(user_id)
+                    reply_text(event.reply_token, "The selected patient changed. Please report the issue again.")
+                    return
+                caregiver = _caregiver_user(user_id)
+                label = save_caregiver_issue(
+                    patient, caregiver["id"], payload.get("issue_type", "other"), user_text,
+                )
+                clear_operation_state(user_id)
+                reply_text(
+                    event.reply_token,
+                    f"Recorded: {label}\nTime: {taipei_now().strftime('%Y-%m-%d %H:%M')}\nDetails: {user_text}",
+                )
+                return
+
         if user and user_text in {
             "重新載入選單",
             "重新綁定選單",
@@ -5109,6 +5472,33 @@ def handle_image_message(event):
             )
             return
 
+        user = get_user(user_id) if user_id else None
+        if user and user.get("role") == "caregiver":
+            patient = get_selected_caregiver_patient(user_id)
+            caregiver = _caregiver_user(user_id)
+            connection = get_db_connection()
+            try:
+                cursor = connection.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO ai_medication_scans (
+                        patient_id,uploaded_by,line_message_id,image_path,
+                        processing_status,created_at
+                    ) VALUES (%s,%s,%s,%s,'uploaded',CURRENT_TIMESTAMP)
+                    """,
+                    (patient["patient_id"], caregiver["id"], event.message.id, image_path),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback(); raise
+            finally:
+                connection.close()
+            reply_text(
+                event.reply_token,
+                f"Prescription image saved for {patient['patient_name']}.\nThe recognition result will appear after processing.",
+            )
+            return
+
         reply_text(
             event.reply_token,
             "已收到圖片。",
@@ -5149,6 +5539,10 @@ def handle_postback(event):
 
         if action in ELDER_MEDICATION_ACTIONS:
             if handle_elder_medication_postback(event, action, params):
+                return
+
+        if action in CAREGIVER_ACTIONS:
+            if handle_caregiver_postback(event, action, params):
                 return
 
         if action in FAMILY_ACTIONS:
