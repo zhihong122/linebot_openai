@@ -133,6 +133,10 @@ def get_user_id(event):
 
 
 def reply_text(reply_token, text):
+    message_text = safe_text(text).strip()
+    if not message_text:
+        message_text = "目前沒有可顯示的資料。"
+
     api_client, messaging_api = get_messaging_api()
 
     try:
@@ -140,7 +144,7 @@ def reply_text(reply_token, text):
             ReplyMessageRequest(
                 reply_token=reply_token,
                 messages=[
-                    TextMessage(text=safe_text(text))
+                    TextMessage(text=message_text)
                 ],
             )
         )
@@ -1717,6 +1721,13 @@ def elder_calendar_text(patient):
         upcoming_only=False,
         limit=30,
     )
+    return calendar_event_text(
+        {
+            "display_name": patient["patient_name"],
+            "patient_id": patient["patient_id"],
+        },
+        events,
+    )
 
 
 def elder_followup_reminder_text(patient):
@@ -1753,13 +1764,6 @@ def elder_followup_reminder_text(patient):
         if item.get("description"):
             lines.append(f"備註：{item['description']}")
     return "\n".join(lines)
-    return calendar_event_text(
-        {
-            "display_name": patient["patient_name"],
-            "patient_id": patient["patient_id"],
-        },
-        events,
-    )
 
 
 def handle_elder_extended_postback(event, action, params):
@@ -5522,6 +5526,7 @@ def handle_image_message(event):
 
 @handler.add(PostbackEvent)
 def handle_postback(event):
+    action = None
     try:
         params = parse_qs(
             event.postback.data or ""
@@ -5537,6 +5542,16 @@ def handle_postback(event):
             [None],
         )[0]
 
+        postback_user_id = get_user_id(event)
+        postback_user = get_user(postback_user_id) if postback_user_id else None
+        app.logger.info(
+            "POSTBACK action=%s user_id=%s user_role=%s raw_data=%s",
+            action,
+            postback_user_id,
+            postback_user.get("role") if postback_user else None,
+            event.postback.data or "",
+        )
+
         if action in ELDER_MEDICATION_ACTIONS:
             if handle_elder_medication_postback(event, action, params):
                 return
@@ -5546,6 +5561,13 @@ def handle_postback(event):
                 return
 
         if action in FAMILY_ACTIONS:
+            if not postback_user or postback_user.get("role") != "family":
+                raise RuntimeError(
+                    "目前選單與使用者身份不一致："
+                    f"收到家屬功能 action={action}，"
+                    f"目前身份={postback_user.get('role') if postback_user else 'unknown'}。"
+                    "請重新建立並綁定正確的 Rich Menu。"
+                )
             if handle_family_postback(event, action, params):
                 return
 
@@ -5690,7 +5712,7 @@ def handle_postback(event):
         try:
             reply_text(
                 event.reply_token,
-                f"身份設定失敗：{error}",
+                f"功能操作失敗（action={action or 'unknown'}）：{error}",
             )
         except Exception:
             app.logger.error(traceback.format_exc())
