@@ -1183,33 +1183,39 @@ def ensure_today_scheduled_log(patient_id, medication):
     connection = get_db_connection()
     try:
         cursor = connection.cursor()
+        # 舊資料庫未必已建立三欄唯一約束，因此不要依賴 ON CONFLICT。
         cursor.execute(
             """
-            INSERT INTO medication_logs (
-                schedule_id,
-                medication_id,
-                patient_id,
-                scheduled_at,
-                status,
-                created_at,
-                updated_at
-            )
-            VALUES (%s,%s,%s,%s,'scheduled',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
-            ON CONFLICT (schedule_id, patient_id, scheduled_local_date)
-            DO UPDATE SET
-                medication_id = EXCLUDED.medication_id,
-                scheduled_at = EXCLUDED.scheduled_at,
-                updated_at = CURRENT_TIMESTAMP
+            UPDATE medication_logs
+            SET medication_id=%s, scheduled_at=%s,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE schedule_id=%s AND patient_id=%s
+              AND scheduled_local_date=%s
             RETURNING id, status::text
             """,
             (
-                medication["schedule_id"],
-                medication["medication_id"],
-                patient_id,
-                scheduled_local,
+                medication["medication_id"], scheduled_local,
+                medication["schedule_id"], patient_id, now.date(),
             ),
         )
         row = cursor.fetchone()
+        if not row:
+            cursor.execute(
+                """
+                INSERT INTO medication_logs (
+                    schedule_id, medication_id, patient_id, scheduled_at,
+                    status, created_at, updated_at
+                ) VALUES (
+                    %s,%s,%s,%s,'scheduled',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+                )
+                RETURNING id, status::text
+                """,
+                (
+                    medication["schedule_id"], medication["medication_id"],
+                    patient_id, scheduled_local,
+                ),
+            )
+            row = cursor.fetchone()
         connection.commit()
         return row[0], row[1]
     except Exception:
@@ -1242,48 +1248,47 @@ def mark_elder_meal_taken(patient, meal_slot, reported_by):
                 medication["schedule_time"],
                 tzinfo=TAIPEI_TZ,
             )
+            note = f"長者確認已服用{ELDER_MEAL_LABELS[meal_slot]}"
             cursor.execute(
                 """
-                INSERT INTO medication_logs (
-                    schedule_id,
-                    medication_id,
-                    patient_id,
-                    scheduled_at,
-                    taken_at,
-                    status,
-                    reported_by,
-                    note,
-                    created_at,
-                    updated_at
-                )
-                VALUES (
-                    %s,%s,%s,%s,%s,'taken',%s,%s,
-                    CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
-                )
-                ON CONFLICT (schedule_id, patient_id, scheduled_local_date)
-                DO UPDATE SET
-                    taken_at = CASE
-                        WHEN medication_logs.status = 'taken'
-                            THEN medication_logs.taken_at
-                        ELSE EXCLUDED.taken_at
+                UPDATE medication_logs
+                SET medication_id=%s, scheduled_at=%s,
+                    taken_at=CASE
+                        WHEN status::text='taken' THEN taken_at ELSE %s
                     END,
-                    status = 'taken',
-                    reported_by = EXCLUDED.reported_by,
-                    note = EXCLUDED.note,
-                    updated_at = CURRENT_TIMESTAMP
+                    status='taken', reported_by=%s, note=%s,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE schedule_id=%s AND patient_id=%s
+                  AND scheduled_local_date=%s
                 RETURNING status::text, taken_at
                 """,
                 (
-                    medication["schedule_id"],
-                    medication["medication_id"],
-                    patient["patient_id"],
-                    scheduled_local,
-                    now,
-                    reported_by,
-                    f"長者確認已服用{ELDER_MEAL_LABELS[meal_slot]}",
+                    medication["medication_id"], scheduled_local, now,
+                    reported_by, note, medication["schedule_id"],
+                    patient["patient_id"], now.date(),
                 ),
             )
             result = cursor.fetchone()
+            if not result:
+                cursor.execute(
+                    """
+                    INSERT INTO medication_logs (
+                        schedule_id, medication_id, patient_id, scheduled_at,
+                        taken_at, status, reported_by, note,
+                        created_at, updated_at
+                    ) VALUES (
+                        %s,%s,%s,%s,%s,'taken',%s,%s,
+                        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+                    )
+                    RETURNING status::text, taken_at
+                    """,
+                    (
+                        medication["schedule_id"], medication["medication_id"],
+                        patient["patient_id"], scheduled_local, now,
+                        reported_by, note,
+                    ),
+                )
+                result = cursor.fetchone()
             if medication.get("status") == "taken":
                 already_taken.append(medication["medication_name"])
             else:
@@ -2107,7 +2112,7 @@ def handle_elder_extended_postback(event, action, params):
     if action == "elder_calendar_save_datetime":
         state = get_operation_state(line_user_id)
         payload = state.get("payload", {}) if state else {}
-        dt_value = getattr(getattr(event.postback, "params", None), "datetime", None)
+        dt_value = get_postback_datetime(event)
         if not dt_value:
             raise RuntimeError("沒有取得日期時間")
         selected_dt = datetime.fromisoformat(dt_value).replace(tzinfo=TAIPEI_TZ)
@@ -2385,7 +2390,8 @@ def caregiver_records_text(patient, period):
         cursor.execute(
             f"""
             SELECT m.medication_name,ml.status::text,ml.scheduled_at,ml.taken_at,
-                   COALESCE(ms.dose_amount,m.dose_per_time),m.quantity_unit
+                   COALESCE(NULLIF(ms.dose_amount,''),m.dose_per_time::text),
+                   m.quantity_unit
             FROM medication_logs ml
             JOIN medications m ON m.id=ml.medication_id
             LEFT JOIN medication_schedules ms ON ms.id=ml.schedule_id
@@ -2647,6 +2653,21 @@ def datetime_item(label, data, mode="datetime", initial=None, minimum=None, maxi
     if maximum:
         kwargs["max"] = maximum
     return QuickReplyItem(action=DatetimePickerAction(**kwargs))
+
+
+def get_postback_datetime(event):
+    """兼容 LINE SDK v3 的 dict 與 model 兩種 datetime params。"""
+    postback_params = getattr(getattr(event, "postback", None), "params", None)
+    if isinstance(postback_params, dict):
+        return postback_params.get("datetime")
+    if postback_params is None:
+        return None
+    value = getattr(postback_params, "datetime", None)
+    if value:
+        return value
+    if hasattr(postback_params, "to_dict"):
+        return postback_params.to_dict().get("datetime")
+    return None
 
 
 def get_app_user_by_line_id(line_user_id):
@@ -3350,14 +3371,34 @@ def list_patient_medications(patient_id, active_only=True):
                 SELECT
                     COALESCE(SUM(
                         CASE WHEN ml.status::text = 'taken'
-                             THEN COALESCE(ms.dose_amount, m.dose_per_time, 0)
+                             THEN COALESCE(
+                                 NULLIF(
+                                     regexp_replace(
+                                         COALESCE(ms.dose_amount,''),
+                                         '[^0-9.]','','g'
+                                     ),
+                                     ''
+                                 )::numeric,
+                                 m.dose_per_time,
+                                 0
+                             )
                              ELSE 0 END
                     ), 0) AS total_consumed,
                     COALESCE(SUM(
                         CASE WHEN ml.status::text = 'taken'
                                   AND a.created_at IS NOT NULL
                                   AND ml.taken_at >= a.created_at
-                             THEN COALESCE(ms.dose_amount, m.dose_per_time, 0)
+                             THEN COALESCE(
+                                 NULLIF(
+                                     regexp_replace(
+                                         COALESCE(ms.dose_amount,''),
+                                         '[^0-9.]','','g'
+                                     ),
+                                     ''
+                                 )::numeric,
+                                 m.dose_per_time,
+                                 0
+                             )
                              ELSE 0 END
                     ), 0) AS consumed_since_adjustment
                 FROM medication_logs ml
@@ -4285,7 +4326,7 @@ def handle_family_calendar_postback(event,action,params):
     if action == "family_calendar_save_datetime":
         state = get_operation_state(user_id)
         payload = state.get("payload",{}) if state else {}
-        dt_value = getattr(getattr(event.postback,"params",None),"datetime",None)
+        dt_value = get_postback_datetime(event)
         if not dt_value:
             raise RuntimeError("沒有取得選擇的日期時間")
         selected_dt = datetime.fromisoformat(dt_value)
