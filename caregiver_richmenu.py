@@ -128,7 +128,7 @@ MENU_DEFINITIONS = {
     "patient1_prescription_medication": six_menu(
         "Caregiver - Photograph Prescription",
         [
-            {"type": "camera", "label": "Photograph Prescription"},
+            {"type": "camera", "label": "Photograph Rx"},
             switch("cg_med_plan", "switch-to-caregiver-medication-plan"),
             postback("action=caregiver_prescription_details", "Prescription Details"),
             postback("action=caregiver_recognition_result", "Recognition Result"),
