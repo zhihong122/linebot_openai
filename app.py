@@ -5,6 +5,8 @@ import traceback
 import math
 import re
 import uuid
+import threading
+import time
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
@@ -90,6 +92,11 @@ ROLE_CONFIG = {
         "env_name": "ELDERLY_RICH_MENU_ID",
     },
 }
+
+# 群組中呼叫的 Rich Menu 為暫時性選單。
+# 使用者每次操作選單都會重新計算 10 分鐘。
+TEMP_RICH_MENU_MINUTES = 10
+TEMP_RICH_MENU_CLEANUP_SECONDS = 30
 
 
 # =========================================================
@@ -229,6 +236,28 @@ def init_database():
                 selected_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS temporary_rich_menu_sessions (
+                line_user_id VARCHAR(64) PRIMARY KEY,
+                role VARCHAR(30) NOT NULL,
+                line_rich_menu_id VARCHAR(255) NOT NULL,
+                source_type VARCHAR(20) NOT NULL,
+                conversation_id VARCHAR(255),
+                expires_at TIMESTAMPTZ NOT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'active',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_temporary_rich_menu_expiry
+            ON temporary_rich_menu_sessions (status, expires_at)
             """
         )
         connection.commit()
@@ -828,6 +857,243 @@ def link_rich_menu(user_id, rich_menu_id):
     )
 
     return True
+
+
+def unlink_rich_menu(user_id):
+    """解除指定使用者目前綁定的 per-user Rich Menu。"""
+    if not user_id:
+        raise RuntimeError("無法取得 LINE User ID")
+
+    url = (
+        "https://api.line.me/v2/bot/user/"
+        f"{user_id}/richmenu"
+    )
+    response = requests.delete(
+        url,
+        headers={
+            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
+        },
+        timeout=20,
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            "Rich Menu 解除失敗："
+            f"HTTP {response.status_code} {response.text}"
+        )
+
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE user_rich_menu_bindings b
+            SET is_current = FALSE,
+                unbound_at = CURRENT_TIMESTAMP
+            FROM app_users u
+            WHERE b.user_id = u.id
+              AND u.line_user_id = %s
+              AND b.is_current = TRUE
+            """,
+            (user_id,),
+        )
+        cursor.execute(
+            """
+            UPDATE app_users
+            SET current_rich_menu_id = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE line_user_id = %s
+            """,
+            (user_id,),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+    app.logger.info("Rich Menu 已解除：user_id=%s", user_id)
+    return True
+
+
+def open_temporary_rich_menu_session(event, user_id, role, rich_menu_id):
+    """記錄群組／多人聊天室中的暫時 Rich Menu，10 分鐘後自動解除。"""
+    source = getattr(event, "source", None)
+    source_type = getattr(source, "type", None) or "unknown"
+    conversation_id = (
+        getattr(source, "group_id", None)
+        or getattr(source, "room_id", None)
+    )
+
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO temporary_rich_menu_sessions (
+                line_user_id, role, line_rich_menu_id,
+                source_type, conversation_id, expires_at,
+                status, updated_at
+            )
+            VALUES (
+                %s, %s, %s, %s, %s,
+                CURRENT_TIMESTAMP + (%s * INTERVAL '1 minute'),
+                'active', CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (line_user_id)
+            DO UPDATE SET
+                role = EXCLUDED.role,
+                line_rich_menu_id = EXCLUDED.line_rich_menu_id,
+                source_type = EXCLUDED.source_type,
+                conversation_id = EXCLUDED.conversation_id,
+                expires_at = EXCLUDED.expires_at,
+                status = 'active',
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                user_id,
+                role,
+                rich_menu_id,
+                source_type,
+                conversation_id,
+                TEMP_RICH_MENU_MINUTES,
+            ),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def refresh_temporary_rich_menu_session(user_id):
+    """使用者操作暫時選單時，延長其有效時間。"""
+    if not user_id:
+        return False
+
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE temporary_rich_menu_sessions
+            SET expires_at = CURRENT_TIMESTAMP + (%s * INTERVAL '1 minute'),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE line_user_id = %s
+              AND status = 'active'
+            """,
+            (TEMP_RICH_MENU_MINUTES, user_id),
+        )
+        changed = cursor.rowcount > 0
+        connection.commit()
+        return changed
+    except Exception:
+        connection.rollback()
+        app.logger.error("延長暫時 Rich Menu 時發生錯誤")
+        app.logger.error(traceback.format_exc())
+        return False
+    finally:
+        connection.close()
+
+
+def close_temporary_rich_menu_session(user_id):
+    """立即關閉暫時 Rich Menu；即使工作階段不存在也會解除選單。"""
+    unlink_rich_menu(user_id)
+
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            "DELETE FROM temporary_rich_menu_sessions WHERE line_user_id = %s",
+            (user_id,),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def cleanup_expired_rich_menu_sessions():
+    """認領並解除已逾時選單；SKIP LOCKED 可避免多個 Gunicorn worker 重複處理。"""
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            WITH expired AS (
+                SELECT line_user_id
+                FROM temporary_rich_menu_sessions
+                WHERE status = 'active'
+                  AND expires_at <= CURRENT_TIMESTAMP
+                ORDER BY expires_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT 20
+            )
+            UPDATE temporary_rich_menu_sessions s
+            SET status = 'closing',
+                updated_at = CURRENT_TIMESTAMP
+            FROM expired
+            WHERE s.line_user_id = expired.line_user_id
+            RETURNING s.line_user_id
+            """
+        )
+        expired_user_ids = [row[0] for row in cursor.fetchall()]
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+    for expired_user_id in expired_user_ids:
+        try:
+            unlink_rich_menu(expired_user_id)
+            connection = get_db_connection()
+            try:
+                cursor = connection.cursor()
+                cursor.execute(
+                    "DELETE FROM temporary_rich_menu_sessions WHERE line_user_id = %s",
+                    (expired_user_id,),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+        except Exception:
+            app.logger.error(
+                "自動解除 Rich Menu 失敗：user_id=%s",
+                expired_user_id,
+            )
+            app.logger.error(traceback.format_exc())
+            connection = get_db_connection()
+            try:
+                cursor = connection.cursor()
+                cursor.execute(
+                    """
+                    UPDATE temporary_rich_menu_sessions
+                    SET status = 'active',
+                        expires_at = CURRENT_TIMESTAMP + INTERVAL '1 minute',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE line_user_id = %s
+                    """,
+                    (expired_user_id,),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+
+def temporary_rich_menu_cleanup_worker():
+    while True:
+        try:
+            cleanup_expired_rich_menu_sessions()
+        except Exception:
+            app.logger.error("清理暫時 Rich Menu 時發生錯誤")
+            app.logger.error(traceback.format_exc())
+        time.sleep(TEMP_RICH_MENU_CLEANUP_SECONDS)
 
 
 def bind_role_rich_menu(user_id, role):
@@ -5292,6 +5558,76 @@ def handle_text_message(event):
             reply_text(event.reply_token, "已取消本次操作。")
             return
 
+        if user and user_text in {
+            "選單",
+            "呼叫選單",
+            "開啟選單",
+            "重新載入選單",
+            "重新綁定選單",
+            "載入選單",
+            "menu",
+            "Menu",
+        }:
+            rich_menu_id = bind_role_rich_menu(
+                user_id,
+                user["role"],
+            )
+
+            save_user(
+                user_id=user_id,
+                display_name=user.get("display_name") or "使用者",
+                role=user["role"],
+                rich_menu_id=rich_menu_id,
+                picture_url=user.get("picture_url"),
+                language=user.get("language"),
+            )
+
+            source = getattr(event, "source", None)
+            source_type = getattr(source, "type", None)
+            is_group_conversation = source_type in {"group", "room"}
+
+            if is_group_conversation:
+                open_temporary_rich_menu_session(
+                    event,
+                    user_id,
+                    user["role"],
+                    rich_menu_id,
+                )
+
+            role_name = ROLE_CONFIG.get(
+                user["role"],
+                {},
+            ).get("name", user["role"])
+
+            expiry_text = (
+                "\n選單會在最後一次操作 10 分鐘後自動關閉；"
+                "也可以輸入「關閉選單」立即關閉。"
+                if is_group_conversation
+                else ""
+            )
+
+            reply_text(
+                event.reply_token,
+                (
+                    f"已載入「{role_name}」專用功能選單。"
+                    f"{expiry_text}"
+                ),
+            )
+            return
+
+        if user_id and user_text in {
+            "關閉選單",
+            "隱藏選單",
+            "close menu",
+            "Close menu",
+        }:
+            close_temporary_rich_menu_session(user_id)
+            reply_text(
+                event.reply_token,
+                "功能選單已關閉。下次需要時請再輸入「選單」。",
+            )
+            return
+
         if user_id and user and user.get("role") == "family":
             if handle_family_text_input(event, user_text, user_id):
                 return
@@ -5315,40 +5651,6 @@ def handle_text_message(event):
                     f"Recorded: {label}\nTime: {taipei_now().strftime('%Y-%m-%d %H:%M')}\nDetails: {user_text}",
                 )
                 return
-
-        if user and user_text in {
-            "重新載入選單",
-            "重新綁定選單",
-            "載入選單",
-        }:
-            rich_menu_id = bind_role_rich_menu(
-                user_id,
-                user["role"],
-            )
-
-            save_user(
-                user_id=user_id,
-                display_name=user.get("display_name") or "使用者",
-                role=user["role"],
-                rich_menu_id=rich_menu_id,
-                picture_url=user.get("picture_url"),
-                language=user.get("language"),
-            )
-
-            role_name = ROLE_CONFIG.get(
-                user["role"],
-                {},
-            ).get("name", user["role"])
-
-            reply_text(
-                event.reply_token,
-                (
-                    f"已重新載入「{role_name}」專用功能選單。\n"
-                    f"LINE User ID：{user_id}"
-                ),
-            )
-            return
-
 
         if user_id:
             elder_state = get_operation_state(user_id)
@@ -5585,6 +5887,11 @@ def handle_postback(event):
 
         postback_user_id = get_user_id(event)
         postback_user = get_user(postback_user_id) if postback_user_id else None
+
+        # Rich Menu 的 postback（包含 richmenuswitch data）都視為仍在使用，
+        # 將群組暫時選單的有效時間重新延長 10 分鐘。
+        refresh_temporary_rich_menu_session(postback_user_id)
+
         app.logger.info(
             "POSTBACK action=%s user_id=%s user_role=%s raw_data=%s",
             action,
@@ -5764,6 +6071,12 @@ def handle_postback(event):
 # =========================================================
 
 init_database()
+
+threading.Thread(
+    target=temporary_rich_menu_cleanup_worker,
+    name="temporary-rich-menu-cleanup",
+    daemon=True,
+).start()
 
 
 if __name__ == "__main__":
