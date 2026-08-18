@@ -34,8 +34,6 @@ from linebot.v3.messaging import (
     CameraRollAction,
     URIAction,
     PushMessageRequest,
-    FlexMessage,
-    FlexContainer,
 )
 from linebot.v3.webhooks import (
     MessageEvent,
@@ -2971,23 +2969,7 @@ def reply_message(reply_token, message):
         api_client.close()
 
 
-def _group_flex_button(label, data, color="#395590"):
-    return {
-        "type": "button",
-        "style": "primary",
-        "height": "sm",
-        "color": color,
-        "margin": "md",
-        "action": {
-            "type": "postback",
-            "label": label[:20],
-            "data": data,
-            "displayText": label,
-        },
-    }
-
-
-def create_group_flex_menu(role, page=None):
+def create_group_quick_menu(role, page=None):
     config = GROUP_FLEX_MENUS.get(role)
     if not config:
         raise RuntimeError(f"尚未設定身份 {role} 的群組選單")
@@ -3000,54 +2982,31 @@ def create_group_flex_menu(role, page=None):
         config["title"],
     )
 
-    rows = []
-    for index in range(0, len(entries), 2):
-        buttons = []
-        for label, key in entries[index:index + 2]:
-            if not is_submenu and key in pages:
-                data = f"action=group_flex_menu&menu={key}"
-            else:
-                data = f"action={key}"
-            buttons.append(_group_flex_button(label, data))
-        if len(buttons) == 1:
-            buttons.append({"type": "box", "layout": "vertical", "flex": 1})
-        rows.append({
-            "type": "box", "layout": "horizontal", "spacing": "md",
-            "contents": buttons,
-        })
-
-    if not rows:
-        rows.append({
-            "type": "text",
-            "text": "這個分類目前尚未設定功能。",
-            "wrap": True,
-            "color": "#666666",
-        })
-
-    footer_buttons = []
-    if is_submenu:
-        footer_buttons.append(_group_flex_button(
-            "返回主選單", "action=group_flex_menu", "#6B7280"
+    items = []
+    for label, key in entries:
+        if not is_submenu and key in pages:
+            data = f"action=group_quick_menu&menu={key}"
+        else:
+            data = f"action={key}"
+        items.append(QuickReplyItem(
+            action=PostbackAction(label=label[:20], data=data)
         ))
-    footer_buttons.append(_group_flex_button(
-        "關閉選單", "action=close_group_flex_menu", "#A63D40"
-    ))
 
-    bubble = {
-        "type": "bubble",
-        "header": {
-            "type": "box", "layout": "vertical", "backgroundColor": "#263F78",
-            "contents": [
-                {"type": "text", "text": title, "weight": "bold", "size": "xl", "color": "#FFFFFF"},
-                {"type": "text", "text": "點擊下方按鈕執行功能｜10 分鐘有效", "size": "xs", "color": "#DCE6FF", "margin": "sm"},
-            ],
-        },
-        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": rows},
-        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": footer_buttons},
-    }
-    return FlexMessage(
-        alt_text=f"{title}（可點擊操作）",
-        contents=FlexContainer.from_dict(bubble),
+    if is_submenu:
+        items.append(QuickReplyItem(action=PostbackAction(
+            label="返回主選單", data="action=group_quick_menu"
+        )))
+    items.append(QuickReplyItem(action=PostbackAction(
+        label="關閉選單", data="action=close_group_quick_menu"
+    )))
+
+    prompt = f"【{title}】\n請點擊下方按鈕。選單 10 分鐘有效。"
+    if not entries:
+        prompt = f"【{title}】\n這個分類目前尚未設定功能。"
+
+    return TextMessage(
+        text=prompt,
+        quick_reply=QuickReply(items=items),
     )
 
 
@@ -5732,7 +5691,7 @@ def handle_text_message(event):
             is_group_conversation = source_type in {"group", "room"}
 
             if is_group_conversation:
-                # Rich Menu 不會顯示在群組底部；群組改傳可點擊的 Flex 選單。
+                # Rich Menu 不會顯示在群組底部；群組改傳分層 Quick Reply。
                 rich_menu_id = get_role_rich_menu_id(user["role"]) or "group-flex"
                 open_temporary_rich_menu_session(
                     event,
@@ -5742,7 +5701,7 @@ def handle_text_message(event):
                 )
                 reply_message(
                     event.reply_token,
-                    create_group_flex_menu(user["role"]),
+                    create_group_quick_menu(user["role"]),
                 )
             else:
                 rich_menu_id = bind_role_rich_menu(user_id, user["role"])
@@ -6043,14 +6002,14 @@ def handle_postback(event):
         source_type = getattr(getattr(event, "source", None), "type", None)
         is_group_conversation = source_type in {"group", "room"}
         is_group_menu_action = (
-            action in {"group_flex_menu", "close_group_flex_menu"}
+            action in {"group_quick_menu", "close_group_quick_menu"}
             or action in ELDER_MEDICATION_ACTIONS
             or action in CAREGIVER_ACTIONS
             or action in FAMILY_ACTIONS
         )
 
         if is_group_conversation and is_group_menu_action:
-            if action == "close_group_flex_menu":
+            if action == "close_group_quick_menu":
                 delete_temporary_group_menu_session(postback_user_id)
                 reply_text(
                     event.reply_token,
@@ -6067,11 +6026,11 @@ def handle_postback(event):
 
             refresh_temporary_rich_menu_session(postback_user_id)
 
-            if action == "group_flex_menu":
+            if action == "group_quick_menu":
                 requested_page = params.get("menu", [None])[0]
                 reply_message(
                     event.reply_token,
-                    create_group_flex_menu(
+                    create_group_quick_menu(
                         postback_user.get("role") if postback_user else None,
                         requested_page,
                     ),
