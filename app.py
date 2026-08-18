@@ -34,6 +34,8 @@ from linebot.v3.messaging import (
     CameraRollAction,
     URIAction,
     PushMessageRequest,
+    FlexMessage,
+    FlexContainer,
 )
 from linebot.v3.webhooks import (
     MessageEvent,
@@ -97,6 +99,44 @@ ROLE_CONFIG = {
 # 使用者每次操作選單都會重新計算 10 分鐘。
 TEMP_RICH_MENU_MINUTES = 10
 TEMP_RICH_MENU_CLEANUP_SECONDS = 30
+
+# 群組聊天室不會顯示底部 Rich Menu，因此群組改用可保留在對話中的
+# Flex Message。第一層按鈕開啟第二層功能，第二層沿用既有 postback action。
+GROUP_FLEX_MENUS = {
+    "family": {
+        "title": "家屬功能選單",
+        "home": [
+            ("監控中心", "family_monitoring"), ("家庭管理", "family_management"),
+            ("藥物管理", "family_medication"), ("行事曆", "family_calendar"),
+            ("報表", "family_report"), ("設定", "family_settings"),
+        ],
+        "pages": {
+            "family_monitoring": [("今日狀態", "family_monitor_today_status"), ("漏服通知", "family_monitor_missed"), ("緊急通知", "family_monitor_emergency"), ("不舒服紀錄", "family_monitor_discomfort"), ("服藥率統計", "family_monitor_adherence")],
+            "family_management": [("新增長者", "family_add_elder"), ("修改長者", "family_manage_elder"), ("新增看護", "family_add_caregiver"), ("指派看護", "family_assign_caregiver"), ("家庭群組 ID", "family_bind_group")],
+            "family_medication": [("查看藥物", "family_medication_list"), ("修正藥物", "family_medication_correct"), ("剩餘藥量", "family_medication_remaining"), ("快用完", "family_medication_low"), ("藥袋紀錄", "family_medication_bag_records")],
+            "family_calendar": [("查看行事曆", "family_calendar_view"), ("新增行程", "family_calendar_add"), ("修改行程", "family_calendar_edit"), ("刪除行程", "family_calendar_delete"), ("回診提醒", "family_calendar_reminder")],
+            "family_report": [("今日報表", "family_report_today"), ("近 7 天", "family_report_7days"), ("近 30 天", "family_report_30days"), ("異常統計", "family_report_abnormal"), ("輸出摘要", "family_report_summary")],
+            "family_settings": [],
+        },
+    },
+    "elderly": {
+        "title": "長者功能選單",
+        "home": [("今日用藥", "elder_today"), ("我的藥物", "elder_medicine"), ("用藥回報", "elder_taken"), ("不舒服回報", "elder_discomfort"), ("行事曆", "elder_calendar"), ("SOS", "elder_sos")],
+        "pages": {
+            "elder_today": [("早餐", "elder_today_breakfast"), ("午餐", "elder_today_lunch"), ("晚餐", "elder_today_dinner"), ("睡前", "elder_today_bedtime"), ("今日全部", "elder_today_all")],
+            "elder_medicine": [("藥物清單", "elder_medicine_list"), ("藥物資訊", "elder_medicine_info"), ("剩餘藥量", "elder_medicine_remaining"), ("拍攝藥袋", "elder_medicine_capture"), ("停用藥物", "elder_medicine_stop")],
+            "elder_taken": [("早餐已服", "elder_taken_breakfast"), ("午餐已服", "elder_taken_lunch"), ("晚餐已服", "elder_taken_dinner"), ("睡前已服", "elder_taken_bedtime"), ("今日紀錄", "elder_taken_today")],
+            "elder_discomfort": [("頭暈", "elder_discomfort_dizziness"), ("頭痛", "elder_discomfort_headache"), ("想吐", "elder_discomfort_nausea"), ("睡不好", "elder_discomfort_sleep"), ("其他問題", "elder_discomfort_other")],
+            "elder_calendar": [("查看行事曆", "elder_calendar_view"), ("新增行程", "elder_calendar_add"), ("修改行程", "elder_calendar_edit"), ("刪除行程", "elder_calendar_delete"), ("回診提醒", "elder_calendar_reminder")],
+            "elder_sos": [("緊急聯絡人 1", "elder_sos_contact1"), ("緊急聯絡人 2", "elder_sos_contact2"), ("通知全部", "elder_sos_notify_all")],
+        },
+    },
+    "caregiver": {
+        "title": "看護功能選單",
+        "home": [("選擇患者", "caregiver_select_patient"), ("今日任務", "caregiver_tasks"), ("用藥紀錄", "caregiver_medication_records"), ("異常回報", "caregiver_report_issue"), ("行事曆", "caregiver_calendar"), ("SOS", "caregiver_emergency")],
+        "pages": {},
+    },
+}
 
 
 # =========================================================
@@ -998,10 +1038,50 @@ def refresh_temporary_rich_menu_session(user_id):
         connection.close()
 
 
+def has_active_group_menu_session(user_id):
+    """只有仍在 10 分鐘期限內的群組 Flex 選單才可操作。"""
+    if not user_id:
+        return False
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT 1
+            FROM temporary_rich_menu_sessions
+            WHERE line_user_id = %s
+              AND status = 'active'
+              AND expires_at > CURRENT_TIMESTAMP
+            LIMIT 1
+            """,
+            (user_id,),
+        )
+        return cursor.fetchone() is not None
+    finally:
+        connection.close()
+
+
 def close_temporary_rich_menu_session(user_id):
     """立即關閉暫時 Rich Menu；即使工作階段不存在也會解除選單。"""
     unlink_rich_menu(user_id)
 
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            "DELETE FROM temporary_rich_menu_sessions WHERE line_user_id = %s",
+            (user_id,),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def delete_temporary_group_menu_session(user_id):
+    """關閉群組 Flex 選單工作階段，不影響私人聊天室的 Rich Menu。"""
     connection = get_db_connection()
     try:
         cursor = connection.cursor()
@@ -1051,7 +1131,6 @@ def cleanup_expired_rich_menu_sessions():
 
     for expired_user_id in expired_user_ids:
         try:
-            unlink_rich_menu(expired_user_id)
             connection = get_db_connection()
             try:
                 cursor = connection.cursor()
@@ -2890,6 +2969,86 @@ def reply_message(reply_token, message):
         )
     finally:
         api_client.close()
+
+
+def _group_flex_button(label, data, color="#395590"):
+    return {
+        "type": "button",
+        "style": "primary",
+        "height": "sm",
+        "color": color,
+        "margin": "md",
+        "action": {
+            "type": "postback",
+            "label": label[:20],
+            "data": data,
+            "displayText": label,
+        },
+    }
+
+
+def create_group_flex_menu(role, page=None):
+    config = GROUP_FLEX_MENUS.get(role)
+    if not config:
+        raise RuntimeError(f"尚未設定身份 {role} 的群組選單")
+
+    pages = config.get("pages", {})
+    is_submenu = bool(page and page in pages)
+    entries = pages.get(page, []) if is_submenu else config["home"]
+    title = config["title"] if not is_submenu else next(
+        (label for label, key in config["home"] if key == page),
+        config["title"],
+    )
+
+    rows = []
+    for index in range(0, len(entries), 2):
+        buttons = []
+        for label, key in entries[index:index + 2]:
+            if not is_submenu and key in pages:
+                data = f"action=group_flex_menu&menu={key}"
+            else:
+                data = f"action={key}"
+            buttons.append(_group_flex_button(label, data))
+        if len(buttons) == 1:
+            buttons.append({"type": "box", "layout": "vertical", "flex": 1})
+        rows.append({
+            "type": "box", "layout": "horizontal", "spacing": "md",
+            "contents": buttons,
+        })
+
+    if not rows:
+        rows.append({
+            "type": "text",
+            "text": "這個分類目前尚未設定功能。",
+            "wrap": True,
+            "color": "#666666",
+        })
+
+    footer_buttons = []
+    if is_submenu:
+        footer_buttons.append(_group_flex_button(
+            "返回主選單", "action=group_flex_menu", "#6B7280"
+        ))
+    footer_buttons.append(_group_flex_button(
+        "關閉選單", "action=close_group_flex_menu", "#A63D40"
+    ))
+
+    bubble = {
+        "type": "bubble",
+        "header": {
+            "type": "box", "layout": "vertical", "backgroundColor": "#263F78",
+            "contents": [
+                {"type": "text", "text": title, "weight": "bold", "size": "xl", "color": "#FFFFFF"},
+                {"type": "text", "text": "點擊下方按鈕執行功能｜10 分鐘有效", "size": "xs", "color": "#DCE6FF", "margin": "sm"},
+            ],
+        },
+        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": rows},
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": footer_buttons},
+    }
+    return FlexMessage(
+        alt_text=f"{title}（可點擊操作）",
+        contents=FlexContainer.from_dict(bubble),
+    )
 
 
 def make_quick_reply_message(text, items):
@@ -5568,51 +5727,40 @@ def handle_text_message(event):
             "menu",
             "Menu",
         }:
-            rich_menu_id = bind_role_rich_menu(
-                user_id,
-                user["role"],
-            )
-
-            save_user(
-                user_id=user_id,
-                display_name=user.get("display_name") or "使用者",
-                role=user["role"],
-                rich_menu_id=rich_menu_id,
-                picture_url=user.get("picture_url"),
-                language=user.get("language"),
-            )
-
             source = getattr(event, "source", None)
             source_type = getattr(source, "type", None)
             is_group_conversation = source_type in {"group", "room"}
 
             if is_group_conversation:
+                # Rich Menu 不會顯示在群組底部；群組改傳可點擊的 Flex 選單。
+                rich_menu_id = get_role_rich_menu_id(user["role"]) or "group-flex"
                 open_temporary_rich_menu_session(
                     event,
                     user_id,
                     user["role"],
                     rich_menu_id,
                 )
-
-            role_name = ROLE_CONFIG.get(
-                user["role"],
-                {},
-            ).get("name", user["role"])
-
-            expiry_text = (
-                "\n選單會在最後一次操作 10 分鐘後自動關閉；"
-                "也可以輸入「關閉選單」立即關閉。"
-                if is_group_conversation
-                else ""
-            )
-
-            reply_text(
-                event.reply_token,
-                (
-                    f"已載入「{role_name}」專用功能選單。"
-                    f"{expiry_text}"
-                ),
-            )
+                reply_message(
+                    event.reply_token,
+                    create_group_flex_menu(user["role"]),
+                )
+            else:
+                rich_menu_id = bind_role_rich_menu(user_id, user["role"])
+                save_user(
+                    user_id=user_id,
+                    display_name=user.get("display_name") or "使用者",
+                    role=user["role"],
+                    rich_menu_id=rich_menu_id,
+                    picture_url=user.get("picture_url"),
+                    language=user.get("language"),
+                )
+                role_name = ROLE_CONFIG.get(user["role"], {}).get(
+                    "name", user["role"]
+                )
+                reply_text(
+                    event.reply_token,
+                    f"已載入「{role_name}」專用功能選單。",
+                )
             return
 
         if user_id and user_text in {
@@ -5621,7 +5769,11 @@ def handle_text_message(event):
             "close menu",
             "Close menu",
         }:
-            close_temporary_rich_menu_session(user_id)
+            source_type = getattr(getattr(event, "source", None), "type", None)
+            if source_type in {"group", "room"}:
+                delete_temporary_group_menu_session(user_id)
+            else:
+                close_temporary_rich_menu_session(user_id)
             reply_text(
                 event.reply_token,
                 "功能選單已關閉。下次需要時請再輸入「選單」。",
@@ -5888,9 +6040,48 @@ def handle_postback(event):
         postback_user_id = get_user_id(event)
         postback_user = get_user(postback_user_id) if postback_user_id else None
 
+        source_type = getattr(getattr(event, "source", None), "type", None)
+        is_group_conversation = source_type in {"group", "room"}
+        is_group_menu_action = (
+            action in {"group_flex_menu", "close_group_flex_menu"}
+            or action in ELDER_MEDICATION_ACTIONS
+            or action in CAREGIVER_ACTIONS
+            or action in FAMILY_ACTIONS
+        )
+
+        if is_group_conversation and is_group_menu_action:
+            if action == "close_group_flex_menu":
+                delete_temporary_group_menu_session(postback_user_id)
+                reply_text(
+                    event.reply_token,
+                    "選單已關閉。下次需要時請在群組重新輸入「選單」。",
+                )
+                return
+
+            if not has_active_group_menu_session(postback_user_id):
+                reply_text(
+                    event.reply_token,
+                    "這份選單已超過 10 分鐘，請重新輸入「選單」。",
+                )
+                return
+
+            refresh_temporary_rich_menu_session(postback_user_id)
+
+            if action == "group_flex_menu":
+                requested_page = params.get("menu", [None])[0]
+                reply_message(
+                    event.reply_token,
+                    create_group_flex_menu(
+                        postback_user.get("role") if postback_user else None,
+                        requested_page,
+                    ),
+                )
+                return
+
         # Rich Menu 的 postback（包含 richmenuswitch data）都視為仍在使用，
         # 將群組暫時選單的有效時間重新延長 10 分鐘。
-        refresh_temporary_rich_menu_session(postback_user_id)
+        if not is_group_conversation:
+            refresh_temporary_rich_menu_session(postback_user_id)
 
         app.logger.info(
             "POSTBACK action=%s user_id=%s user_role=%s raw_data=%s",
