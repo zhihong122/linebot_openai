@@ -2986,11 +2986,14 @@ def create_group_quick_menu(role, page=None):
     for label, key in entries:
         if not is_submenu and key in pages:
             data = f"action=group_quick_menu&menu={key}"
+            # 分頁／分類按鈕只切換下一層，不在聊天室顯示點擊文字。
+            items.append(QuickReplyItem(
+                action=PostbackAction(label=label[:20], data=data)
+            ))
         else:
             data = f"action={key}"
-        items.append(QuickReplyItem(
-            action=PostbackAction(label=label[:20], data=data)
-        ))
+            # 真正執行功能時才顯示使用者點擊的項目，接著由 Bot 回傳結果。
+            items.append(postback_item(label, data, display_text=label))
 
     if is_submenu:
         items.append(QuickReplyItem(action=PostbackAction(
