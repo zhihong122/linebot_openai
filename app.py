@@ -14,6 +14,7 @@ from urllib.parse import parse_qs
 
 import requests
 from openai import OpenAI
+from medication_analyzer import analyze_medication_image
 
 from richmenu_manager import get_home_rich_menu_id
 
@@ -2792,6 +2793,8 @@ def caregiver_prescription_text(patient, mode):
     record = records[0]
     if mode == "recognition":
         content = record.get("parsed_result") or record.get("original_text")
+        if isinstance(content, dict) and content.get("display_text"):
+            content = content["display_text"]
         if isinstance(content, (dict, list)):
             content = json.dumps(content, ensure_ascii=False, indent=2)
         return f"{patient['patient_name']} – Recognition Result\n\n{content or 'Recognition is not complete yet.'}"
@@ -4245,7 +4248,9 @@ def handle_family_medication_postback(event, action, params):
 
         clear_operation_state(user_id)
         parsed = record.get("parsed_result")
-        if parsed:
+        if isinstance(parsed, dict) and parsed.get("display_text"):
+            details = parsed["display_text"]
+        elif parsed:
             details = json.dumps(parsed, ensure_ascii=False, indent=2)
         else:
             details = record.get("original_text") or "未保存辨識內容"
@@ -5543,6 +5548,64 @@ def gpt_response(user_text):
     return answer or "目前沒有取得回應，請再試一次。"
 
 
+def save_medication_scan_analysis(scan_id, result=None, error_message=None):
+    """Save a completed/failed scan without changing medication schedules."""
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor()
+        if result is not None:
+            cursor.execute(
+                """
+                UPDATE ai_medication_scans
+                SET processing_status='completed',
+                    original_text=%s,
+                    parsed_result=%s::jsonb
+                WHERE id=%s
+                """,
+                (
+                    result["display_text"],
+                    json.dumps(result, ensure_ascii=False),
+                    scan_id,
+                ),
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE ai_medication_scans
+                SET processing_status='failed', original_text=%s
+                WHERE id=%s
+                """,
+                (safe_text(error_message or "辨識失敗", 1000), scan_id),
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def process_medication_scan(scan_id, image_path):
+    """Decode QR locally, analyze the bag with GPT-4.1, and persist it."""
+    try:
+        result = analyze_medication_image(
+            client=openai_client,
+            image_path=image_path,
+            model=os.getenv("MEDICATION_VISION_MODEL", "gpt-4.1"),
+        )
+        save_medication_scan_analysis(scan_id, result=result)
+        return result
+    except Exception as error:
+        try:
+            save_medication_scan_analysis(
+                scan_id,
+                error_message=f"{type(error).__name__}: {error}",
+            )
+        except Exception:
+            app.logger.error(traceback.format_exc())
+        raise
+
+
 # =========================================================
 # Flask 路由
 # =========================================================
@@ -5933,6 +5996,7 @@ def handle_image_message(event):
                         created_at
                     )
                     VALUES (%s,%s,%s,%s,'uploaded',CURRENT_TIMESTAMP)
+                    RETURNING id
                     """,
                     (
                         patient["patient_id"],
@@ -5941,6 +6005,7 @@ def handle_image_message(event):
                         image_path,
                     ),
                 )
+                scan_id = cursor.fetchone()[0]
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -5948,10 +6013,14 @@ def handle_image_message(event):
             finally:
                 connection.close()
 
+            result = process_medication_scan(scan_id, image_path)
             clear_operation_state(user_id)
             reply_text(
                 event.reply_token,
-                "藥單圖片已上傳並保存，家屬可在「藥袋紀錄」中查看。",
+                safe_text(
+                    "藥袋辨識完成，家屬可在「藥袋紀錄」中查看。\n\n"
+                    + result["display_text"]
+                ),
             )
             return
 
@@ -5968,17 +6037,23 @@ def handle_image_message(event):
                         patient_id,uploaded_by,line_message_id,image_path,
                         processing_status,created_at
                     ) VALUES (%s,%s,%s,%s,'uploaded',CURRENT_TIMESTAMP)
+                    RETURNING id
                     """,
                     (patient["patient_id"], caregiver["id"], event.message.id, image_path),
                 )
+                scan_id = cursor.fetchone()[0]
                 connection.commit()
             except Exception:
                 connection.rollback(); raise
             finally:
                 connection.close()
+            result = process_medication_scan(scan_id, image_path)
             reply_text(
                 event.reply_token,
-                f"Prescription image saved for {patient['patient_name']}.\nThe recognition result will appear after processing.",
+                safe_text(
+                    f"{patient['patient_name']} – Prescription analysis complete\n\n"
+                    + result["display_text"]
+                ),
             )
             return
 
