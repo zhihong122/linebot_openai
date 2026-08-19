@@ -1060,9 +1060,7 @@ def has_active_group_menu_session(user_id):
 
 
 def close_temporary_rich_menu_session(user_id):
-    """立即關閉暫時 Rich Menu；即使工作階段不存在也會解除選單。"""
-    unlink_rich_menu(user_id)
-
+    """只關閉臨時 Quick Reply 工作階段，絕不解除私人 Rich Menu。"""
     connection = get_db_connection()
     try:
         cursor = connection.cursor()
@@ -1079,24 +1077,12 @@ def close_temporary_rich_menu_session(user_id):
 
 
 def delete_temporary_group_menu_session(user_id):
-    """關閉群組 Flex 選單工作階段，不影響私人聊天室的 Rich Menu。"""
-    connection = get_db_connection()
-    try:
-        cursor = connection.cursor()
-        cursor.execute(
-            "DELETE FROM temporary_rich_menu_sessions WHERE line_user_id = %s",
-            (user_id,),
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+    """關閉群組 Quick Reply 工作階段，不影響私人聊天室的 Rich Menu。"""
+    close_temporary_rich_menu_session(user_id)
 
 
 def cleanup_expired_rich_menu_sessions():
-    """認領並解除已逾時選單；SKIP LOCKED 可避免多個 Gunicorn worker 重複處理。"""
+    """刪除逾時 Quick Reply 工作階段；絕不解除私人 Rich Menu。"""
     connection = get_db_connection()
     try:
         cursor = connection.cursor()
@@ -1141,7 +1127,7 @@ def cleanup_expired_rich_menu_sessions():
                 connection.close()
         except Exception:
             app.logger.error(
-                "自動解除 Rich Menu 失敗：user_id=%s",
+                "清除逾時 Quick Reply 工作階段失敗：user_id=%s",
                 expired_user_id,
             )
             app.logger.error(traceback.format_exc())
