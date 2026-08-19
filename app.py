@@ -1174,15 +1174,21 @@ def temporary_rich_menu_cleanup_worker():
 
 
 def bind_role_rich_menu(user_id, role):
-    rich_menu_id = get_role_rich_menu_id(role)
+    # 看護首頁依目前有效指派數量動態選擇。
+    rich_menu_id = None
+    if role != "caregiver":
+        rich_menu_id = get_role_rich_menu_id(role)
 
-    if not rich_menu_id:
+    if role != "caregiver" and not rich_menu_id:
         raise RuntimeError(
             f"身份 {role} 尚未取得首頁 Rich Menu ID"
         )
 
     try:
-        link_rich_menu(user_id, rich_menu_id)
+        if role == "caregiver":
+            rich_menu_id = link_caregiver_home_menu(user_id)
+        else:
+            link_rich_menu(user_id, rich_menu_id)
 
         record_rich_menu_binding(
             line_user_id=user_id,
@@ -2578,7 +2584,8 @@ def handle_elder_extended_postback(event, action, params):
 # =========================================================
 
 CAREGIVER_ACTIONS = {
-    "caregiver_select_patient", "caregiver_emergency", "caregiver_tasks",
+    "caregiver_select_patient", "caregiver_back_selector",
+    "caregiver_emergency", "caregiver_tasks",
     "caregiver_medication_schedule", "caregiver_medication_plan",
     "caregiver_medication_records", "caregiver_medication_summary",
     "caregiver_calendar", "caregiver_prescription_details",
@@ -2621,6 +2628,22 @@ def list_caregiver_patients(line_user_id):
                  "user_id": r[2], "line_user_id": r[3]} for r in cursor.fetchall()]
     finally:
         connection.close()
+
+
+def caregiver_home_alias(line_user_id):
+    """一位長者顯示雙格首頁；兩位以上顯示長者選擇首頁。"""
+    return (
+        "caregiver_single_main"
+        if len(list_caregiver_patients(line_user_id)) == 1
+        else "caregiver_main"
+    )
+
+
+def link_caregiver_home_menu(line_user_id):
+    return link_rich_menu_alias(
+        line_user_id,
+        caregiver_home_alias(line_user_id),
+    )
 
 
 def select_caregiver_patient(line_user_id, slot):
@@ -2820,8 +2843,12 @@ def handle_caregiver_postback(event, action, params):
     if action == "caregiver_select_patient":
         slot = params.get("slot", [None])[0]
         patient = select_caregiver_patient(user_id, slot)
-        link_rich_menu_alias(user_id, "cg_patient_main")
+        link_rich_menu_alias(user_id, f"cg_p{int(slot)}_main")
         reply_text(event.reply_token, f"Selected: {patient['patient_name']}\nThe patient menu is now ready.")
+        return True
+
+    if action == "caregiver_back_selector":
+        link_caregiver_home_menu(user_id)
         return True
 
     patient = get_selected_caregiver_patient(user_id, required=False)
@@ -2836,7 +2863,16 @@ def handle_caregiver_postback(event, action, params):
         reply_text(event.reply_token, "Please select a patient first.")
         return True
     if action == "caregiver_emergency":
-        link_rich_menu_alias(user_id, "cg_sos")
+        patients = list_caregiver_patients(user_id)
+        selected_slot = next(
+            (
+                index
+                for index, item in enumerate(patients, 1)
+                if item["patient_id"] == patient["patient_id"]
+            ),
+            1,
+        )
+        link_rich_menu_alias(user_id, f"cg_p{selected_slot}_sos")
         reply_text(event.reply_token, f"Emergency contacts for {patient['patient_name']} are ready.")
     elif action in {"caregiver_tasks", "caregiver_medication_plan"}:
         reply_text(event.reply_token, caregiver_plan_text(patient, params.get("slot", [None])[0]))
