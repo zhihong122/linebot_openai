@@ -3,3 +3,7 @@ gunicorn==23.0.0
 line-bot-sdk==3.23.0
 openai==2.6.1
 psycopg2-binary==2.9.10
+
+opencv-python-headless>=4.10,<5
+numpy>=2,<3
+zxing-cpp>=2.3,<3
