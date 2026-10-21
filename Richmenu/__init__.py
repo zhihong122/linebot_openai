@@ -1,0 +1,1 @@
+"""LINE Rich Menu package."""
