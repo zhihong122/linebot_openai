@@ -216,6 +216,30 @@ class RoleTests(unittest.TestCase):
     def test_unrecognized_messages_continue_existing_handler(self):
         self.assertFalse(self.roles.handle_text(self.event('hello')))
 
+    def test_shenfen_spelling_opens_role_picker(self):
+        self.api['postback_item'] = lambda label, data: (label, data)
+        self.api['make_quick_reply_message'] = lambda text, items: (text, items)
+        messages = []
+        self.api['reply_message'] = lambda token, message: messages.append(message)
+        self.assertTrue(self.roles.handle_text(self.event('切換身分')))
+        self.assertEqual(len(messages[0][1]), 3)
+        self.assertIsNone(self.db.session)
+
+    def test_shenfen_spelling_restores_and_disables(self):
+        self.roles._change(OWNER, 'elderly')
+        self.assertTrue(self.roles.handle_text(self.event('還原身分')))
+        self.assertEqual(self.db.user[1], 'role-family')
+        self.roles._change(OWNER, 'caregiver')
+        self.assertTrue(self.roles.handle_text(self.event('停用身分切換')))
+        self.assertEqual(self.db.user[1], 'role-family')
+        self.assertTrue(self.db.session['disabled'])
+
+    def test_shenfen_alias_does_not_bypass_authorization(self):
+        os.environ['MASTER_ROLE_SWITCH_ENABLED'] = 'false'
+        self.assertTrue(self.roles.handle_text(self.event('切換身分')))
+        self.assertEqual(self.replies[-1], '此帳號未啟用身份切換。')
+        self.assertIsNone(self.db.session)
+
     def test_sql_error_rolls_back_changes(self):
         initial = copy.deepcopy(self.db.user)
         original_execute = Cursor.execute

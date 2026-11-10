@@ -235,7 +235,8 @@ class MasterRoles:
         return False
 
     def handle_text(self, event):
-        text = (event.message.text or "").strip()
+        # Both spellings are common in Taiwan; normalize commands before routing.
+        text = (event.message.text or "").strip().replace("身分", "身份")
         line_id = self.api["get_user_id"](event)
         # Restoring must not first retry a broken test menu. Otherwise a missing
         # caregiver menu prevents the owner from ever escaping caregiver mode.
