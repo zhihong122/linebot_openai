@@ -19,6 +19,11 @@ CREATE TABLE IF NOT EXISTS master_role_sessions (
 LABELS = {"family": "家屬", "elderly": "長者", "caregiver": "看護"}
 COMMANDS = {"切換身份", "身份狀態", "還原身份", "停用身份切換",
             "切換為家屬", "切換為長者", "切換為看護"}
+RECOVERY_COMMANDS = {"還原身份", "停用身份切換"}
+
+
+class MenuSyncError(RuntimeError):
+    """The DB change succeeded; the external LINE menu still needs retrying."""
 
 
 class MasterRoles:
@@ -164,7 +169,10 @@ class MasterRoles:
             raise
         finally:
             connection.close()
-        self._sync_menu_locked(line_id)
+        try:
+            self._sync_menu_locked(line_id)
+        except Exception as error:
+            raise MenuSyncError("身份設定已儲存，LINE 選單尚待更新") from error
 
     def sync_menu(self, line_id):
         if not line_id:
@@ -174,7 +182,10 @@ class MasterRoles:
         if not session or not session["menu_pending"]:
             return
         with self._account_lock(line_id):
-            self._sync_menu_locked(line_id)
+            try:
+                self._sync_menu_locked(line_id)
+            except Exception as error:
+                raise MenuSyncError("LINE 選單尚待更新") from error
 
     def _sync_menu_locked(self, line_id):
         session = self.session(line_id)
@@ -202,6 +213,15 @@ class MasterRoles:
             connection.close()
 
     def prepare(self, event):
+        try:
+            return self._prepare(event)
+        except MenuSyncError:
+            self.api["reply_text"](event.reply_token,
+                "身份設定已儲存，但 LINE 選單暫時更新失敗。\n"
+                "可輸入「還原身份」或「停用身份切換」；稍後再操作會重試選單更新。")
+            return True
+
+    def _prepare(self, event):
         """Revoking the env allowlist also restores an active account on its next event."""
         line_id = self.api["get_user_id"](event)
         if not line_id:
@@ -215,10 +235,12 @@ class MasterRoles:
         return False
 
     def handle_text(self, event):
-        if self.prepare(event):
-            return True
         text = (event.message.text or "").strip()
         line_id = self.api["get_user_id"](event)
+        # Restoring must not first retry a broken test menu. Otherwise a missing
+        # caregiver menu prevents the owner from ever escaping caregiver mode.
+        if text not in RECOVERY_COMMANDS and self.prepare(event):
+            return True
         if text not in COMMANDS | {"我的 LINE ID"}:
             return False
         reply = self.api["reply_text"]
@@ -238,12 +260,23 @@ class MasterRoles:
             items = [self.api["postback_item"](label, f"action=master_switch_role&role={role}") for role, label in LABELS.items()]
             reply_message = self.api["make_quick_reply_message"]("選擇測試身份。長者／看護使用專用測試患者；家屬保留原本家庭權限。\n可輸入「還原身份」或「停用身份切換」。", items)
             self.api["reply_message"](event.reply_token, reply_message)
-        elif text in {"還原身份", "停用身份切換"}:
-            self._change(line_id, disable=text == "停用身份切換")
+        elif text in RECOVERY_COMMANDS:
+            try:
+                self._change(line_id, disable=text == "停用身份切換")
+            except MenuSyncError:
+                reply(event.reply_token, "原始身份已還原。" +
+                      ("身份切換已停用。" if text == "停用身份切換" else "") +
+                      "LINE 選單更新尚未成功，稍後再操作會重試；還原備份仍保留。")
+                return True
             reply(event.reply_token, "已還原原始身份與選單。" + ("身份切換已停用。" if text == "停用身份切換" else "測試紀錄保留於測試患者，可再次切換身份。"))
         elif text.startswith("切換為"):
             role = next(role for role, label in LABELS.items() if text == "切換為" + label)
-            self._change(line_id, role)
+            try:
+                self._change(line_id, role)
+            except MenuSyncError:
+                reply(event.reply_token, f"身份已切換為{LABELS[role]}，但 LINE 選單尚未更新。\n"
+                      "可輸入「還原身份」返回，或稍後再操作重試。")
+                return True
             reply(event.reply_token, f"已切換為{LABELS[role]}。輸入「還原身份」即可返回。")
         else:
             user = self.api["get_user"](line_id)
@@ -264,6 +297,12 @@ class MasterRoles:
                                                    message=SimpleNamespace(text="切換為" + LABELS[role])))
         session = self.session(line_id) if line_id else None
         if session and session["active"]:
+            expected_role = ("family" if (action or "").startswith("family_") else
+                             "elderly" if (action or "").startswith("elder_") else
+                             "caregiver" if (action or "").startswith("caregiver_") else None)
+            if expected_role and expected_role != session["role"]:
+                self.api["reply_text"](event.reply_token, "這是先前身份的舊選單。請使用目前身份的選單，或輸入「切換身份」。")
+                return True
             if action == "select_role" or (session["role"] != "family" and
                 (action or "").startswith(("elder_sos", "elder_discomfort", "caregiver_emergency", "caregiver_sos", "caregiver_report_issue"))):
                 self.api["reply_text"](event.reply_token, "測試身份不發送緊急／異常通知。請用「切換身份」或「還原身份」操作。")

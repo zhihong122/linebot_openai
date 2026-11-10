@@ -228,6 +228,65 @@ class RoleTests(unittest.TestCase):
         self.assertEqual(self.db.user, initial)
         self.assertIsNone(self.db.session)
 
+    def test_restore_command_escapes_broken_test_menu(self):
+        self.fail_menu = True
+        with self.assertRaises(RuntimeError):
+            self.roles._change(OWNER, 'caregiver')
+        self.assertTrue(self.roles.handle_text(self.event('還原身份')))
+        self.assertEqual(self.db.user[1], 'role-family')
+        self.assertFalse(self.db.session['active'])
+        self.assertFalse(self.db.session['pending'])
+
+    def test_disable_command_escapes_broken_test_menu(self):
+        self.fail_menu = True
+        with self.assertRaises(RuntimeError):
+            self.roles._change(OWNER, 'caregiver')
+        self.roles.handle_text(self.event('停用身份切換'))
+        self.assertEqual(self.db.user[1], 'role-family')
+        self.assertTrue(self.db.session['disabled'])
+
+    def test_restore_db_succeeds_even_when_original_menu_unavailable(self):
+        self.roles._change(OWNER, 'elderly')
+        def fail(*args):
+            raise RuntimeError('original menu unavailable')
+        self.api['link_rich_menu'] = fail
+        self.roles.handle_text(self.event('停用身份切換'))
+        self.assertEqual(self.db.user[1], 'role-family')
+        self.assertTrue(self.db.session['pending'])
+        self.assertTrue(self.db.session['disabled'])
+        self.assertIn('原始身份已還原', self.replies[-1])
+
+    def test_switch_reports_committed_role_and_pending_menu(self):
+        self.fail_menu = True
+        self.assertTrue(self.roles.handle_text(self.event('切換為看護')))
+        self.assertEqual(self.db.user[1], 'role-caregiver')
+        self.assertTrue(self.db.session['pending'])
+        self.assertIn('身份已切換為看護', self.replies[-1])
+
+    def test_pending_menu_blocks_normal_action_with_recovery_hint(self):
+        self.fail_menu = True
+        self.roles.handle_text(self.event('切換為看護'))
+        self.assertTrue(self.roles.prepare(self.event('hello')))
+        self.assertIn('還原身份', self.replies[-1])
+
+    def test_stale_role_buttons_cannot_reach_other_roles(self):
+        self.roles._change(OWNER, 'elderly')
+        for action in ('family_add_elder', 'caregiver_select_patient'):
+            self.assertTrue(self.roles.handle_postback(self.event(), action, {}))
+            self.assertIn('舊選單', self.replies[-1])
+        self.assertFalse(self.roles.handle_postback(self.event(), 'elder_medicine_capture', {}))
+
+    def test_revocation_with_failed_menu_still_restores_database(self):
+        self.roles._change(OWNER, 'elderly')
+        os.environ['MASTER_ROLE_SWITCH_ENABLED'] = 'false'
+        def fail(*args):
+            raise RuntimeError('LINE unavailable')
+        self.api['link_rich_menu'] = fail
+        self.assertTrue(self.roles.prepare(self.event()))
+        self.assertEqual(self.db.user[1], 'role-family')
+        self.assertFalse(self.db.session['active'])
+        self.assertTrue(self.db.session['pending'])
+
 
 if __name__ == '__main__':
     unittest.main()

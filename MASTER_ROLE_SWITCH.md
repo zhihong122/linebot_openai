@@ -63,6 +63,8 @@
 - 還原後將測試患者設為非啟用，保留掃描與其他測試紀錄；不自動刪除歷史資料。
 - 測試長者／看護的 SOS、不舒服／異常通知停用，避免測試發出真實通知。
 - LINE 選單更新與 PostgreSQL 不是同一筆交易。資料庫已切換但 LINE 更新失敗時，`menu_pending` 保留，下一次事件自動重試；可輸入「還原身份」。
+- 「還原身份」與「停用身份切換」直接執行還原，不先重試失敗的測試選單。即使原始選單更新也失敗，資料庫身份仍會還原，Bot 會明確回覆選單尚待重試。
+- 切換中的帳號按到其他身份的舊按鈕時會被攔截，避免進入錯誤的身份功能。
 - 移除允許 ID 或關閉環境變數後，已切換帳號會在下一次收到事件時自動還原；不是設定一改就立即還原。建議先在 LINE 還原，再關閉環境變數。
 
 ## 重新開放已停用的帳號
@@ -87,11 +89,13 @@ WHERE s.user_id = u.id
 
 ## 驗證範圍
 
-本次提供 Python 語法檢查及離線狀態轉移測試，不會在測試中呼叫 LINE、OpenAI 或寫入正式資料庫。
+本次提供 Python 語法檢查、18 項離線狀態轉移測試及 2 項既有圖片處理流程整合測試，共 20 項。
+圖片流程測試直接載入 app.py 的處理函式，驗證長者及看護分流將掃描新增至測試患者，
+外部 LINE、OpenAI 與資料庫均使用替代物件，不會呼叫正式服務或寫入正式資料庫。
 仍須在實際 Render／PostgreSQL／LINE 環境完成上述驗證，尤其確認 `patients.linked_user_id` 允許 NULL，
 `patients` 的其他必填欄位有預設值，以及 `master_role_sessions` 的建表權限。
 
 ```text
-python -m unittest -v test_master_roles
+python -m unittest discover -v
 python -m py_compile app.py master_roles.py
 ```
