@@ -22,7 +22,7 @@ ANALYSIS_PROMPT = """你是一個專門辨識臺灣醫療院所藥袋、處方�
 6. 療程與總量只照圖片輸出，不得加入「剛好吃完」等說明。
 7. 臨床用途只能擷取藥袋上實際寫出的用途，不得由藥名推測。
 8. 副作用、警語、危險警訊若有原始編號或符號，必須保留；一條一行，不得合併或自行分類嚴重程度。
-9. QR Code 已由後端解碼器實際處理。你必須逐字使用使用者訊息提供的 QR 結果與狀態，不得從圖片猜測、修改或補齊網址，也不得聲稱使用 Code Interpreter。
+9. QR Code 已由後端解碼器實際處理。你必須逐字使用使用者訊息提供的 QR 結果，只輸出「QR Code（掃描後連結）」欄位，不得輸出解碼狀態、是否偵測到、是否完整、執行方法、成功方法或失敗原因，不得從圖片猜測、修改或補齊網址，也不得聲稱使用 Code Interpreter。
 10. 使用繁體中文及臺灣常用醫療用語；不要輸出前言、結語、Python 程式碼、Markdown 粗體或「照抄藥袋」等註解。
 
 固定輸出格式（每個欄位都必須保留）：
@@ -39,13 +39,6 @@ ANALYSIS_PROMPT = """你是一個專門辨識臺灣醫療院所藥袋、處方�
 ・警語：
 ・危險警訊：
 ・QR Code（掃描後連結）：
-
-QR Code 解碼狀態：
-・是否偵測到：
-・是否完整：
-・實際執行方法：
-・成功方法：
-・失敗原因：
 """
 
 
@@ -72,15 +65,7 @@ class QRResult:
         return "無法掃描出連結"
 
     def prompt_context(self) -> str:
-        complete = "是" if self.complete is True else "否" if self.complete is False else "無法確認"
-        return (
-            f"QR Code（掃描後連結）：{self.field_value}\n"
-            f"是否偵測到：{'是' if self.detected else '否'}\n"
-            f"是否完整：{complete}\n"
-            f"實際執行方法：{'、'.join(self.attempted_methods) or '未執行'}\n"
-            f"成功方法：{self.successful_method or '無'}\n"
-            f"失敗原因：{'、'.join(self.failure_reasons[:3]) or '無'}"
-        )
+        return f"QR Code（掃描後連結）：{self.field_value}"
 
 
 def _url_or_text(value) -> Optional[str]:
