@@ -53,12 +53,33 @@ def _public_row(r):
             'name_en':r[4], 'section':r[5], 'content':r[6], 'source':r[7],
             'score':round(float(r[8]),4)}
 
+def drug_name_hints(question):
+    """Recognize a complete English brand token and an explicitly stated strength."""
+    ignored = {"what", "which", "does", "have", "with", "side", "effect", "effects",
+               "drug", "medicine", "capsule", "capsules", "tablet", "tablets",
+               "hard", "soft", "standard", "the", "and", "for", "how", "can",
+               "take", "use", "are", "this", "that", "about", "mg", "mcg"}
+    words = [w.lower() for w in re.findall(r"\b[A-Za-z][A-Za-z0-9-]{2,}\b", question)
+             if w.lower() not in ignored]
+    brand = r"\m(?:" + "|".join(re.escape(w) for w in words) + r")\M" if words else r"a^"
+    match = re.search(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(mcg|mg|ug|g|微克|毫克|公克)(?![A-Za-z])", question, re.I)
+    strength = None
+    if match:
+        number = format(float(match.group(1)), ".15g")
+        unit = match.group(2).lower()
+        aliases = {"mg": "mg|毫克", "毫克": "mg|毫克", "g": "g|公克", "公克": "g|公克",
+                   "mcg": "mcg|ug|微克", "ug": "mcg|ug|微克", "微克": "mcg|ug|微克"}[unit]
+        strength = r"(^|[^0-9.])" + re.escape(number) + r"(?:\.0+)?(?:" + aliases + r")([^a-z]|$)"
+    return brand, strength
+
+
 def search_drugs(question, top_k=None, use_vectors=True):
     """Full-text + trigram drug matching, optional pgvector. Never requires API key."""
     question=(question or '').strip()
     if not question: return []
     top_k=top_k or config.TOP_K
     sections=wanted_sections(question)
+    brand, strength = drug_name_hints(question)
     client=openai_client() if use_vectors and config.USE_EMBEDDINGS else None
     vector=None
     if client:
@@ -76,7 +97,11 @@ def search_drugs(question, top_k=None, use_vectors=True):
               OR position(lower(coalesce(d.license_number,'')) in lower(%s))>0 AND length(coalesce(d.license_number,''))>=5
               OR similarity(coalesce(d.name_zh,''),%s)>0.48
               OR similarity(coalesce(d.name_en,''),%s)>0.55
-            ) LIMIT 24''',(question,question,question,question,question))
+              OR lower(coalesce(d.name_en,'')) ~ %s
+            ) AND (%s::text IS NULL OR lower(regexp_replace(
+              coalesce(d.name_en,'') || ' ' || coalesce(d.name_zh,''),
+              '[[:space:]]', '', 'g')) ~ %s)
+            LIMIT 24''',(question,question,question,question,question,brand,strength,strength))
         ids=[r[0] for r in cur.fetchall()]
         if ids:
             # Once a drug is identified, restrict to it rather than leaking evidence from other drugs.

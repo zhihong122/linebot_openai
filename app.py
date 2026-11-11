@@ -5545,6 +5545,49 @@ def handle_family_report_postback(event, action, params):
 # OpenAI
 # =========================================================
 
+_rag_slots = threading.BoundedSemaphore(4)
+
+
+def start_rag_reply(event, user_text):
+    """Acknowledge immediately; send the slow local-model answer to the same chat."""
+    if not user_text.strip().startswith("藥物查詢"):
+        return False
+    if os.getenv("RAG_ENABLED", "false").lower() != "true":
+        return False
+    source = event.source
+    target = (getattr(source, "group_id", None)
+              or getattr(source, "room_id", None)
+              or getattr(source, "user_id", None))
+    if not target:
+        reply_text(event.reply_token, "目前無法辨識回覆對象，請在一對一聊天室重試。")
+        return True
+    if not _rag_slots.acquire(blocking=False):
+        reply_text(event.reply_token, "目前藥物查詢較多，請稍後再試。")
+        return True
+
+    def run():
+        api_client = None
+        try:
+            answer = gpt_response(user_text)
+            api_client, messaging_api = get_messaging_api()
+            messaging_api.push_message(PushMessageRequest(
+                to=target, messages=[TextMessage(text=safe_text(answer))]))
+        except Exception:
+            app.logger.exception("Background RAG reply failed")
+        finally:
+            if api_client is not None:
+                api_client.close()
+            _rag_slots.release()
+
+    try:
+        reply_text(event.reply_token, "正在查詢藥品仿單，完成後會回覆結果，請稍候。")
+        threading.Thread(target=run, daemon=True, name="drug-rag-query").start()
+    except Exception:
+        _rag_slots.release()
+        raise
+    return True
+
+
 def gpt_response(user_text):
     if user_text.strip().startswith("藥物查詢"):
         if os.getenv("RAG_ENABLED", "false").lower() != "true":
@@ -5995,6 +6038,8 @@ def handle_text_message(event):
                         ),
                     )
                     return
+        if start_rag_reply(event, user_text):
+            return
         answer = gpt_response(
             user_text
         )
