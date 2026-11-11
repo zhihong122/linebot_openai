@@ -1,6 +1,7 @@
 """Drug RAG: exact drug identification + PostgreSQL text/vector retrieval + grounded response."""
 import os
 import re
+import time
 from .db import connection
 from . import config
 
@@ -120,10 +121,18 @@ def search_drugs(question, top_k=None, use_vectors=True):
             return []
         return [_public_row(row) for row in cur.fetchall()]
 
+def _timed_answer(answer, sources, started):
+    elapsed = time.perf_counter() - started
+    if os.getenv('RAG_SHOW_TIMING', 'true').strip().lower() in ('1', 'true', 'yes', 'on'):
+        answer = f"{answer.rstrip()}\n\nRAG 處理耗時：{elapsed:.2f} 秒"
+    return {'answer': answer, 'sources': sources, 'elapsed_seconds': elapsed}
+
+
 def answer_drug_question(question, top_k=None):
+    started = time.perf_counter()
     results=search_drugs(question,top_k=top_k)
     if not results:
-        return {'answer':'目前知識庫沒有找到足夠的藥品資料，請提供藥品完整名稱或許可證字號。','sources':[]}
+        return _timed_answer('目前知識庫沒有找到足夠的藥品資料，請提供藥品完整名稱或許可證字號。', [], started)
     evidence='\n\n'.join(f"[{i}] {r['name_zh'] or r['name_en']}｜{r['section']}｜許可證：{r['license_number'] or '未提供'}｜資料來源：{r['source'] or '未提供'}\n{r['content']}" for i,r in enumerate(results,1))
     evidence=evidence[:config.MAX_EVIDENCE_CHARS]
     client=chat_client()
@@ -136,4 +145,4 @@ def answer_drug_question(question, top_k=None):
         reasoning_effort="low",
         max_tokens=2048,
     )
-    return {'answer':response.choices[0].message.content,'sources':results}
+    return _timed_answer(response.choices[0].message.content or '', results, started)
