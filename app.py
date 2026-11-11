@@ -17,6 +17,7 @@ from Health_Adapter.Google_Health_Adapter.google_health import register_google_h
 from Health_Adapter.Apple_Health_Adapter.apple_health import register_apple_health
 from openai import OpenAI
 from medication_analyzer import analyze_medication_image
+from medication_rag import enrich_medication_result
 from master_roles import MasterRoles
 
 from Richmenu.richmenu_manager import get_home_rich_menu_id
@@ -5676,6 +5677,7 @@ def process_medication_scan(scan_id, image_path):
             image_path=image_path,
             model=os.getenv("MEDICATION_VISION_MODEL", "gpt-4.1"),
         )
+        result = enrich_medication_result(result)
         save_medication_scan_analysis(scan_id, result=result)
         return result
     except Exception as error:
@@ -5686,6 +5688,56 @@ def process_medication_scan(scan_id, image_path):
             )
         except Exception:
             app.logger.error(traceback.format_exc())
+        raise
+
+
+
+def start_medication_scan_reply(event, scan_id, image_path, heading):
+    """Acknowledge before slow vision/RAG work; push all chunks including timing."""
+    source = event.source
+    target = (getattr(source, "group_id", None)
+              or getattr(source, "room_id", None)
+              or getattr(source, "user_id", None))
+    if not target:
+        raise RuntimeError("無法辨識照片回覆對象")
+    if not _rag_slots.acquire(blocking=False):
+        save_medication_scan_analysis(scan_id, error_message="分析工作繁忙，請重新上傳")
+        reply_text(event.reply_token, "目前分析工作較多，請稍後重新上傳照片。")
+        return
+
+    def run():
+        api_client = None
+        try:
+            result = process_medication_scan(scan_id, image_path)
+            text = heading + result["display_text"]
+            # Do not truncate the last line; LINE allows up to five messages per push.
+            chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
+            api_client, messaging_api = get_messaging_api()
+            for offset in range(0, len(chunks), 5):
+                messaging_api.push_message(PushMessageRequest(
+                    to=target,
+                    messages=[TextMessage(text=chunk) for chunk in chunks[offset:offset + 5]],
+                ))
+        except Exception:
+            app.logger.exception("Background medication scan failed")
+            try:
+                if api_client is None:
+                    api_client, messaging_api = get_messaging_api()
+                messaging_api.push_message(PushMessageRequest(
+                    to=target, messages=[TextMessage(text="藥袋分析或結果傳送失敗，請稍後查看藥袋紀錄或重新上傳。")],
+                ))
+            except Exception:
+                app.logger.exception("Medication failure notification failed")
+        finally:
+            if api_client is not None:
+                api_client.close()
+            _rag_slots.release()
+
+    try:
+        reply_text(event.reply_token, "已收到照片，正在辨識並比對藥品資料，完成後會回覆結果。")
+        threading.Thread(target=run, daemon=True, name="medication-rag-scan").start()
+    except Exception:
+        _rag_slots.release()
         raise
 
 
@@ -6134,14 +6186,10 @@ def handle_image_message(event):
             finally:
                 connection.close()
 
-            result = process_medication_scan(scan_id, image_path)
             clear_operation_state(user_id)
-            reply_text(
-                event.reply_token,
-                safe_text(
-                    "藥袋辨識完成，家屬可在「藥袋紀錄」中查看。\n\n"
-                    + result["display_text"]
-                ),
+            start_medication_scan_reply(
+                event, scan_id, image_path,
+                "藥袋辨識完成，家屬可在「藥袋紀錄」中查看。\n\n",
             )
             return
 
@@ -6168,13 +6216,9 @@ def handle_image_message(event):
                 connection.rollback(); raise
             finally:
                 connection.close()
-            result = process_medication_scan(scan_id, image_path)
-            reply_text(
-                event.reply_token,
-                safe_text(
-                    f"{patient['patient_name']} – Prescription analysis complete\n\n"
-                    + result["display_text"]
-                ),
+            start_medication_scan_reply(
+                event, scan_id, image_path,
+                f"{patient['patient_name']} – Prescription analysis complete\n\n",
             )
             return
 
