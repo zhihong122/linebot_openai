@@ -3379,7 +3379,156 @@ def handle_family_text_input(event, user_text, user_id):
         payload = state.get("payload", {})
         payload["calendar_title"] = user_text[:255]
         set_operation_state(user_id,"family_calendar_add","waiting_calendar_location",payload)
-        reply_text(…2007 tokens truncated…d,action,"confirm_remove",{"elder_id":elder_id,"display_name":elders[elder_id]["display_name"]})
+        reply_text(event.reply_token,
+            "請輸入醫院或地點，例如：埔里基督教醫院\n若沒有地點請輸入「未填寫」。")
+        return True
+
+    if state["step"] == "waiting_calendar_location":
+        payload = state.get("payload", {})
+        payload["calendar_location"] = None if user_text in {"未填寫","無","沒有"} else user_text[:500]
+        set_operation_state(user_id,"family_calendar_add","calendar_waiting_datetime",payload)
+        reply_message(event.reply_token,make_quick_reply_message(
+            "請點選預計前往醫院的日期與時間：",
+            [
+                datetime_item("選擇日期時間",
+                    "action=family_calendar_save_datetime&mode=add",
+                    mode="datetime",
+                    minimum=taipei_now().strftime("%Y-%m-%dT%H:%M")),
+                postback_item("取消","action=family_cancel"),
+            ]))
+        return True
+
+    if state["step"] == "waiting_calendar_edit_title":
+        payload = state.get("payload", {})
+        update_patient_calendar_event(
+            payload["event_id"],payload["patient_id"],"title",user_text[:255])
+        clear_operation_state(user_id)
+        reply_text(event.reply_token,f"行程名稱已修改為：{user_text[:255]}")
+        return True
+
+    if state["step"] == "waiting_calendar_edit_location":
+        payload = state.get("payload", {})
+        new_location = None if user_text in {"未填寫","無","沒有"} else user_text[:500]
+        update_patient_calendar_event(
+            payload["event_id"],payload["patient_id"],"location",new_location)
+        clear_operation_state(user_id)
+        reply_text(event.reply_token,f"行程地點已修改為：{new_location or '未填寫'}")
+        return True
+
+
+    if state["step"] == "waiting_monitor_contact_name":
+        payload = state.get("payload", {})
+        payload["contact_name"] = user_text[:255]
+        set_operation_state(
+            user_id,"family_monitor_emergency",
+            "waiting_monitor_contact_relationship",payload
+        )
+        reply_text(
+            event.reply_token,
+            "請輸入與長者的關係，例如：女兒、兒子、配偶。"
+        )
+        return True
+
+    if state["step"] == "waiting_monitor_contact_relationship":
+        payload = state.get("payload", {})
+        payload["relationship"] = user_text[:100]
+        set_operation_state(
+            user_id,"family_monitor_emergency",
+            "waiting_monitor_contact_phone",payload
+        )
+        reply_text(event.reply_token,"請輸入聯絡電話，例如：0912345678。")
+        return True
+
+    if state["step"] == "waiting_monitor_contact_phone":
+        payload = state.get("payload", {})
+        phone = re.sub(r"[^0-9+]", "", user_text)
+        if len(phone) < 8:
+            raise RuntimeError("電話格式不正確，請重新輸入")
+        payload["phone_number"] = phone
+        set_operation_state(
+            user_id,"family_monitor_emergency",
+            "waiting_monitor_contact_line",payload
+        )
+        reply_text(
+            event.reply_token,
+            "請輸入此聯絡人的 LINE User ID；若沒有請輸入「略過」。"
+        )
+        return True
+
+    if state["step"] == "waiting_monitor_contact_line":
+        payload = state.get("payload", {})
+        line_user_id = None if user_text in {"略過","無","沒有"} else user_text
+        upsert_family_emergency_contact(
+            payload["patient_id"],
+            payload["priority"],
+            payload["contact_name"],
+            payload["relationship"],
+            payload["phone_number"],
+            line_user_id,
+        )
+        clear_operation_state(user_id)
+        reply_text(
+            event.reply_token,
+            (
+                "緊急聯絡人設定完成！\n"
+                f"長者：{payload['patient_name']}\n"
+                f"順位：{payload['priority']}\n"
+                f"姓名：{payload['contact_name']}\n"
+                f"關係：{payload['relationship']}\n"
+                f"電話：{payload['phone_number']}"
+            ),
+        )
+        return True
+
+    return False
+
+
+def handle_family_postback(event, action, params):
+    if action.startswith("family_monitor_"):
+        return handle_family_monitor_postback(event, action, params)
+
+    if action.startswith("family_report_"):
+        return handle_family_report_postback(event, action, params)
+
+    if action.startswith("family_calendar_"):
+        return handle_family_calendar_postback(event, action, params)
+
+    if action.startswith("family_medication_"):
+        return handle_family_medication_postback(event, action, params)
+
+    user_id=get_user_id(event)
+    if not user_id:
+        reply_text(event.reply_token,"無法取得您的 LINE User ID。")
+        return True
+    if action == "family_cancel":
+        clear_operation_state(user_id); reply_text(event.reply_token,"已取消本次家庭管理操作。")
+        return True
+    family=ensure_family_admin(user_id); family_id=family["id"]; admin_id=family["admin_user_id"]
+    if action == "family_add_elder":
+        set_operation_state(user_id,action,"waiting_elder_id")
+        reply_text(event.reply_token,"請輸入長者的 LINE User ID。\n\n對方必須先加入 Bot，並將身份設定為「長者」。\n輸入「取消」可結束操作。")
+    elif action == "family_confirm_add_elder":
+        state=get_operation_state(user_id)
+        if not state or not state.get("payload",{}).get("target_id"):
+            raise RuntimeError("新增資料已逾時，請重新操作")
+        import uuid
+        elder_uuid = uuid.UUID(state["payload"]["target_id"])
+        bind_member_to_family(family_id,elder_uuid,"elderly",admin_id)
+        ensure_patient_for_elder_user(elder_uuid)
+        clear_operation_state(user_id)
+        reply_text(event.reply_token,f"已成功新增長者：{state['payload'].get('display_name') or '未命名'}")
+    elif action == "family_manage_elder":
+        elders=list_family_members(family_id,"elderly")
+        if not elders:
+            reply_text(event.reply_token,"目前家庭尚未綁定任何長者。")
+        else:
+            items=[postback_item(e["display_name"],f"action=family_remove_elder&elder_id={e['id']}",f"管理 {e['display_name']}") for e in elders[:12]]
+            reply_message(event.reply_token,make_quick_reply_message("請選擇要從家庭中移除的長者：",items))
+    elif action == "family_remove_elder":
+        elder_id=params.get("elder_id",[None])[0]
+        elders={str(e["id"]):e for e in list_family_members(family_id,"elderly")}
+        if elder_id not in elders: raise RuntimeError("找不到這位長者")
+        set_operation_state(user_id,action,"confirm_remove",{"elder_id":elder_id,"display_name":elders[elder_id]["display_name"]})
         reply_message(event.reply_token,make_quick_reply_message(f"確定要將「{elders[elder_id]['display_name']}」移出家庭嗎？\n相關看護指派也會解除。",[postback_item("確認移除","action=family_confirm_remove_elder"),postback_item("取消","action=family_cancel")]))
     elif action == "family_confirm_remove_elder":
         state=get_operation_state(user_id); import uuid
