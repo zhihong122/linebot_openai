@@ -80,34 +80,19 @@ def search_drugs(question, top_k=None, use_vectors=True):
         ids=[r[0] for r in cur.fetchall()]
         if ids:
             # Once a drug is identified, restrict to it rather than leaking evidence from other drugs.
-            from psycopg.types.json import Jsonb
             cur.execute('''
               SELECT d.id,d.source_id,d.license_number,d.name_zh,d.name_en,c.section,c.content,d.source,
                 (CASE WHEN c.section=ANY(%s) THEN 30 ELSE 0 END
                  + CASE WHEN position(lower(coalesce(d.name_zh,'')) in lower(%s))>0 THEN 20 ELSE 0 END
                  + ts_rank(to_tsvector('simple',c.content),plainto_tsquery('simple',%s))*5
-                 + CASE WHEN %s IS NOT NULL AND c.embedding IS NOT NULL THEN 1 ELSE 0 END) AS score
+                 + CASE WHEN %s::vector IS NOT NULL AND c.embedding IS NOT NULL THEN 1-(c.embedding <=> %s::vector) ELSE 0 END) AS score
               FROM rag_chunks c JOIN rag_drugs d ON d.id=c.drug_id
               WHERE d.id=ANY(%s) AND d.is_active
               ORDER BY score DESC,c.chunk_order ASC LIMIT %s
-            ''',(sections,question,question,vector,ids,top_k))
-        elif vector is not None:
-            cur.execute('''
-              SELECT d.id,d.source_id,d.license_number,d.name_zh,d.name_en,c.section,c.content,d.source,
-                (1-(c.embedding <=> %s::vector)) AS score
-              FROM rag_chunks c JOIN rag_drugs d ON d.id=c.drug_id
-              WHERE d.is_active AND c.embedding IS NOT NULL
-              ORDER BY c.embedding <=> %s::vector LIMIT %s
-            ''',(vector,vector,top_k))
+            ''',(sections,question,question,vector,vector,ids,top_k))
         else:
-            # pg_trgm fallback for Chinese multi-character questions, without vector API.
-            cur.execute('''
-              SELECT d.id,d.source_id,d.license_number,d.name_zh,d.name_en,c.section,c.content,d.source,
-                  greatest(similarity(c.content,%s), similarity(coalesce(d.name_zh,''),%s)) AS score
-              FROM rag_chunks c JOIN rag_drugs d ON d.id=c.drug_id
-              WHERE d.is_active
-              ORDER BY score DESC LIMIT %s
-            ''',(question,question,top_k))
+            # Do not answer from another drug when the requested drug is unidentified.
+            return []
         return [_public_row(row) for row in cur.fetchall()]
 
 def answer_drug_question(question, top_k=None):
@@ -123,5 +108,7 @@ def answer_drug_question(question, top_k=None):
         messages=[{'role':'system','content':system},
                   {'role':'user','content':f'問題：{question}\n\n證據：\n{evidence}'}],
         temperature=0.2,
+        reasoning_effort="low",
+        max_tokens=2048,
     )
     return {'answer':response.choices[0].message.content,'sources':results}

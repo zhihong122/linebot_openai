@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 load_dotenv()
-DATABASE_URL = os.environ.get('DATABASE_URL', '')
+DATABASE_URL = os.getenv('RAG_DATABASE_URL') or os.getenv('DATABASE_URL', '')
 EMBEDDING_MODEL = os.getenv('RAG_EMBEDDING_MODEL', 'text-embedding-3-small')
 CHAT_MODEL = os.getenv('RAG_CHAT_MODEL', 'gpt-oss:20b')
 CHAT_BASE_URL = os.getenv('RAG_CHAT_BASE_URL', 'http://localhost:11434/v1').rstrip('/')
