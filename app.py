@@ -1231,6 +1231,9 @@ ELDER_MEDICATION_ACTIONS = {
     "elder_medicine_capture",
     "elder_medicine_stop",
     "elder_medicine_select",
+    "elder_rag_change_medication",
+    "elder_rag_medication_page",
+    "elder_rag_end",
     "elder_medicine_stop_reason",
     "elder_medicine_confirm_stop",
     "elder_discomfort_dizziness",
@@ -1853,6 +1856,68 @@ def list_elder_active_medications(patient_id):
     return list_patient_medications(patient_id, active_only=True)
 
 
+def elder_rag_control_items():
+    return [
+        postback_item(
+            "更換藥物",
+            "action=elder_rag_change_medication",
+        ),
+        postback_item(
+            "結束問答",
+            "action=elder_rag_end",
+        ),
+    ]
+
+
+def reply_elder_rag_medication_picker(event, patient, page=1):
+    """列出長者目前仍在服用的藥物，作為 RAG 問答主題。"""
+    medications = list_elder_active_medications(patient["patient_id"])
+    if not medications:
+        reply_text(event.reply_token, "目前沒有使用中的藥物可供查詢。")
+        return True
+
+    page_size = 10
+    total_pages = max(1, math.ceil(len(medications) / page_size))
+    try:
+        page = max(1, min(int(page), total_pages))
+    except (TypeError, ValueError):
+        page = 1
+    start = (page - 1) * page_size
+    page_medications = medications[start:start + page_size]
+
+    items = [
+        postback_item(
+            medication["medication_name"][:20],
+            (
+                "action=elder_medicine_select&mode=rag"
+                f"&medication_id={medication['id']}"
+            ),
+        )
+        for medication in page_medications
+    ]
+    if page > 1:
+        items.append(postback_item(
+            "上一頁",
+            f"action=elder_rag_medication_page&page={page - 1}",
+        ))
+    if page < total_pages:
+        items.append(postback_item(
+            "下一頁",
+            f"action=elder_rag_medication_page&page={page + 1}",
+        ))
+    reply_message(
+        event.reply_token,
+        make_quick_reply_message(
+            (
+                "請選擇要詢問 RAG 的藥物："
+                + (f"（第 {page}/{total_pages} 頁）" if total_pages > 1 else "")
+            ),
+            items,
+        ),
+    )
+    return True
+
+
 def elder_medicine_list_text(patient):
     medications = list_patient_medications(
         patient["patient_id"],
@@ -2124,20 +2189,22 @@ def handle_elder_extended_postback(event, action, params):
         return True
 
     if action == "elder_medicine_info":
-        medications = list_elder_active_medications(patient["patient_id"])
-        if not medications:
-            reply_text(event.reply_token, "目前沒有可查看說明的藥物。")
-            return True
-        items = [
-            postback_item(
-                medication["medication_name"][:20],
-                f"action=elder_medicine_select&mode=info&medication_id={medication['id']}",
-            )
-            for medication in medications[:12]
-        ]
-        reply_message(
+        clear_operation_state(line_user_id)
+        return reply_elder_rag_medication_picker(event, patient)
+
+    if action == "elder_rag_change_medication":
+        clear_operation_state(line_user_id)
+        return reply_elder_rag_medication_picker(event, patient)
+
+    if action == "elder_rag_medication_page":
+        page = params.get("page", [1])[0]
+        return reply_elder_rag_medication_picker(event, patient, page=page)
+
+    if action == "elder_rag_end":
+        clear_operation_state(line_user_id)
+        reply_text(
             event.reply_token,
-            make_quick_reply_message("請選擇要查看說明的藥物：", items),
+            "RAG 藥物問答已結束。需要時可再次點選「RAG 藥物資訊」。",
         )
         return True
 
@@ -2194,23 +2261,37 @@ def handle_elder_extended_postback(event, action, params):
         if not medication:
             raise RuntimeError("找不到這筆藥物資料")
 
-        if mode == "info":
-            inv = _medication_inventory_values(medication)
-            reply_text(
+        if mode in {"rag", "info"}:
+            payload = {
+                "patient_id": str(patient["patient_id"]),
+                "medication_id": str(medication["id"]),
+                "medication_name": medication["medication_name"],
+                "generic_name": medication.get("generic_name"),
+                "dosage": medication.get("dosage"),
+                "history": [],
+            }
+            set_operation_state(
+                line_user_id,
+                "elder_rag_chat",
+                "waiting_elder_rag_question",
+                payload,
+            )
+            drug_label = medication["medication_name"]
+            if medication.get("dosage"):
+                drug_label += f" {medication['dosage']}"
+            reply_message(
                 event.reply_token,
-                (
-                    f"藥物：{medication['medication_name']}\n"
-                    f"學名：{medication.get('generic_name') or '未標示'}\n"
-                    f"含量：{medication.get('dosage') or '未標示'}\n"
-                    f"用法：{medication.get('instructions') or '未標示'}\n"
-                    f"開藥日期：{inv['dispense_date'] or '未標示'}\n"
-                    f"療程天數：{inv['course_days'] or '未標示'}\n"
-                    f"原始總量：{_format_quantity(inv['total_quantity'])} "
-                    f"{medication['quantity_unit']}\n"
-                    f"已服用：{_format_quantity(inv['consumed_quantity'])} "
-                    f"{medication['quantity_unit']}\n"
-                    f"目前剩餘：{_format_quantity(inv['remaining'])} "
-                    f"{medication['quantity_unit']}"
+                make_quick_reply_message(
+                    (
+                        f"已選擇：{drug_label}\n\n"
+                        "請直接輸入想詢問的問題，例如：\n"
+                        "・這個藥是治療什麼？\n"
+                        "・有哪些常見副作用？\n"
+                        "・可以和其他藥一起吃嗎？\n"
+                        "・出現什麼情況需要就醫？\n\n"
+                        "回答會以政府藥品仿單資料庫的 RAG 證據為準。"
+                    ),
+                    elder_rag_control_items(),
                 ),
             )
             return True
@@ -5589,6 +5670,166 @@ def start_rag_reply(event, user_text):
     return True
 
 
+def start_elder_rag_reply(event, user_text, user_id, payload):
+    """針對長者已選藥物執行非同步 RAG 問答，並保留短期對話脈絡。"""
+    if os.getenv("RAG_ENABLED", "false").lower() != "true":
+        reply_text(event.reply_token, "RAG 藥物資訊尚未啟用，請稍後再試。")
+        return True
+
+    source = event.source
+    target = (
+        getattr(source, "group_id", None)
+        or getattr(source, "room_id", None)
+        or getattr(source, "user_id", None)
+    )
+    if not target:
+        reply_text(event.reply_token, "目前無法辨識回覆對象，請在私人聊天室重試。")
+        return True
+
+    if not _rag_slots.acquire(blocking=False):
+        reply_text(event.reply_token, "目前 RAG 藥物查詢較多，請稍後再試。")
+        return True
+
+    question = user_text.strip()
+    medication_name = payload.get("medication_name") or "未命名藥物"
+    identity_parts = [medication_name]
+    if payload.get("generic_name"):
+        identity_parts.append(payload["generic_name"])
+    if payload.get("dosage"):
+        identity_parts.append(str(payload["dosage"]))
+    drug_identity = "｜".join(identity_parts)
+
+    history = payload.get("history")
+    if not isinstance(history, list):
+        history = []
+    recent_history = history[-2:]
+    history_text = ""
+    if recent_history:
+        history_lines = []
+        for item in recent_history:
+            if not isinstance(item, dict):
+                continue
+            history_lines.extend([
+                f"前次問題：{str(item.get('question') or '')[:500]}",
+                f"前次回答：{str(item.get('answer') or '')[:800]}",
+            ])
+        if history_lines:
+            history_text = "\n" + "\n".join(history_lines)
+
+    rag_question = (
+        f"目前選定藥物：{drug_identity}。\n"
+        f"使用者本次問題：{question}"
+        f"{history_text}"
+    )
+
+    answering_payload = dict(payload)
+    answering_payload["history"] = history
+    set_operation_state(
+        user_id,
+        "elder_rag_chat",
+        "elder_rag_answering",
+        answering_payload,
+    )
+
+    def run():
+        api_client = None
+        try:
+            answer = gpt_response("藥物查詢 " + rag_question)
+            current_state = get_operation_state(user_id)
+            current_payload = current_state.get("payload", {}) if current_state else {}
+            still_same_chat = (
+                current_state
+                and current_state.get("action") == "elder_rag_chat"
+                and str(current_payload.get("medication_id"))
+                == str(payload.get("medication_id"))
+            )
+            if not still_same_chat:
+                return
+
+            updated_history = list(history)
+            updated_history.append({
+                "question": question[:500],
+                "answer": answer[:1200],
+            })
+            updated_payload = dict(payload)
+            updated_payload["history"] = updated_history[-4:]
+            set_operation_state(
+                user_id,
+                "elder_rag_chat",
+                "waiting_elder_rag_question",
+                updated_payload,
+            )
+
+            api_client, messaging_api = get_messaging_api()
+            messaging_api.push_message(
+                PushMessageRequest(
+                    to=target,
+                    messages=[
+                        TextMessage(
+                            text=safe_text(answer),
+                            quick_reply=QuickReply(
+                                items=elder_rag_control_items()
+                            ),
+                        )
+                    ],
+                )
+            )
+        except Exception:
+            app.logger.exception("Elder medication RAG reply failed")
+            try:
+                set_operation_state(
+                    user_id,
+                    "elder_rag_chat",
+                    "waiting_elder_rag_question",
+                    payload,
+                )
+                if api_client is None:
+                    api_client, messaging_api = get_messaging_api()
+                messaging_api.push_message(
+                    PushMessageRequest(
+                        to=target,
+                        messages=[
+                            TextMessage(
+                                text=(
+                                    "藥物資料查詢暫時無法使用，請稍後再試，"
+                                    "或請醫師、藥師協助確認。"
+                                ),
+                                quick_reply=QuickReply(
+                                    items=elder_rag_control_items()
+                                ),
+                            )
+                        ],
+                    )
+                )
+            except Exception:
+                app.logger.exception("Unable to report elder RAG failure")
+        finally:
+            if api_client is not None:
+                api_client.close()
+            _rag_slots.release()
+
+    try:
+        reply_text(
+            event.reply_token,
+            f"正在查詢「{medication_name}」的政府藥品仿單，完成後會回覆，請稍候。",
+        )
+        threading.Thread(
+            target=run,
+            daemon=True,
+            name="elder-drug-rag-query",
+        ).start()
+    except Exception:
+        _rag_slots.release()
+        set_operation_state(
+            user_id,
+            "elder_rag_chat",
+            "waiting_elder_rag_question",
+            payload,
+        )
+        raise
+    return True
+
+
 def gpt_response(user_text):
     if user_text.strip().startswith("藥物查詢"):
         if os.getenv("RAG_ENABLED", "false").lower() != "true":
@@ -6030,6 +6271,45 @@ def handle_text_message(event):
 
                 step = elder_state.get("step")
                 payload = elder_state.get("payload", {})
+
+                if elder_state.get("action") == "elder_rag_chat":
+                    patient = get_elder_patient_by_line_user_id(user_id)
+
+                    if user_text in {"結束問答", "結束", "停止問答"}:
+                        clear_operation_state(user_id)
+                        reply_text(
+                            event.reply_token,
+                            "RAG 藥物問答已結束。",
+                        )
+                        return
+
+                    if user_text in {"更換藥物", "換藥", "選擇其他藥物"}:
+                        clear_operation_state(user_id)
+                        reply_elder_rag_medication_picker(event, patient)
+                        return
+
+                    if step == "elder_rag_answering":
+                        reply_text(
+                            event.reply_token,
+                            "上一個問題仍在查詢中，請等待回覆後再繼續提問。",
+                        )
+                        return
+
+                    if step == "waiting_elder_rag_question":
+                        if str(patient["patient_id"]) != str(payload.get("patient_id")):
+                            clear_operation_state(user_id)
+                            reply_text(
+                                event.reply_token,
+                                "長者資料已變更，請重新點選「RAG 藥物資訊」。",
+                            )
+                            return
+                        start_elder_rag_reply(
+                            event,
+                            user_text,
+                            user_id,
+                            payload,
+                        )
+                        return
 
                 if step == "waiting_elder_discomfort_text":
                     patient = get_elder_patient_by_line_user_id(user_id)
