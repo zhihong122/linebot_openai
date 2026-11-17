@@ -13,12 +13,19 @@ def _fields(text):
     fields = {}
     current = None
     for line in text.splitlines():
+        heading = re.match(r"^\s*【([^】]+)】\s*$", line)
+        if heading:
+            current = heading.group(1).strip()
+            if current == "藥名與含量":
+                current = "藥名＋含量"
+            fields[current] = ""
+            continue
         match = re.match(r"^\s*[・•·＊*\-]?\s*([^：:]+)[：:](.*)$", line)
         if match and (line.lstrip().startswith(("・", "•", "·", "*", "-", "＊")) or match.group(1).strip() in ("藥名＋含量", *SUPPLEMENT_FIELDS)):
             current = match.group(1).strip()
             fields[current] = match.group(2).strip()
         elif current and line.strip():
-            fields[current] += "\n" + line.strip()
+            fields[current] = (fields[current] + "\n" + line.strip()).strip()
     return fields
 
 
@@ -106,7 +113,7 @@ def enrich_medication_result(result):
                             continue
                         used.add(field)
                         label = "臨床用途" if field == "臨床用途（藥袋標示）" else field
-                        entries.append(f"・{label}：{text.strip()} " + " ".join(f"[{i}]" for i in citations))
+                        entries.append(f"【{label}】\n{text.strip()} " + " ".join(f"[{i}]" for i in citations))
                     metadata["sources"] = sources
                     metadata["status"] = "completed" if entries else "no_supplement"
                     if entries:
@@ -115,7 +122,7 @@ def enrich_medication_result(result):
                             f"{row.get('license_number') or '未提供許可證'}｜{row.get('source') or '未提供來源'}"
                             for i, row in enumerate(sources, 1)
                         ]
-                        section = "RAG 資料庫補充（與照片內容分列）：\n" + "\n".join(entries)
+                        section = "RAG 資料庫補充（與照片內容分列）：\n" + "\n\n".join(entries)
                         section += "\n\n資料來源：\n" + "\n".join(references)
                     else:
                         section = "RAG 補充：未找到足以補充缺少欄位的證據。"
