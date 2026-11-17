@@ -4,6 +4,7 @@ import os
 import sys
 import types
 import unittest
+from medication_identity import resolve_medication
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,9 +18,15 @@ class ScanRAGTests(unittest.TestCase):
         self.env.start()
         os.environ.pop('RAG_MEDICATION_ENABLED', None)
         self.text = '・藥名＋含量：Example 500mg tab\n・每次量：1 粒\n・可能副作用：未標示\n・警語：已標示警語\n・QR Code（掃描後連結）：https://example.com'
-        self.row = dict(drug_id=1, name_zh='', name_en='Example', section='副作用', content='測試來源', license_number='TEST', source='測試資料庫')
+        self.row = dict(drug_id=1, name_zh='', name_en='Example 500mg tablet', ingredient='ExampleIngredient 500mg', section='副作用', content='測試來源', license_number='TEST', source='測試資料庫')
         self.service = types.ModuleType('RAG.rag.service')
         self.service.search_drugs = lambda *a, **kw: [self.row]
+        def lookup(observed, **kwargs):
+            rows = self.service.search_drugs(observed, **kwargs)
+            identity = resolve_medication(observed, rows)
+            return {'sources': rows if identity['status'] == 'matched' else [],
+                    'identity_match': identity}
+        self.service.search_medication_sources = lookup
         response = types.SimpleNamespace(choices=[types.SimpleNamespace(message=types.SimpleNamespace(content='{"supplements":[{"field":"可能副作用","text":"測試補充","citations":[1]},{"field":"每次量","text":"不可補充","citations":[1]},{"field":"警語","text":"不可覆蓋","citations":[1]}]}'))])
         self.service.chat_client = lambda: types.SimpleNamespace(chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=lambda **kw: response)))
         package = types.ModuleType('RAG.rag')
@@ -51,7 +58,7 @@ class ScanRAGTests(unittest.TestCase):
         self.service.search_drugs = lambda *a, **kw: [self.row, dict(self.row, drug_id=2)]
         self.assertEqual(self.run_scan()['rag']['status'], 'ambiguous')
         self.service.search_drugs = lambda *a, **kw: [dict(self.row, name_en='Other')]
-        self.assertEqual(self.run_scan()['rag']['status'], 'ambiguous')
+        self.assertEqual(self.run_scan()['rag']['status'], 'not_found')
     def test_failure_preserves_ocr(self):
         def fail(*a, **kw):
             raise RuntimeError('database unavailable')
@@ -97,6 +104,17 @@ class ScanRAGTests(unittest.TestCase):
         result = ns['process_medication_scan'](123, 'test.jpg')
         self.assertIn('RAG 處理耗時', result['display_text'])
         self.assertEqual(saved[0]['result'], result)
+
+    def test_labeled_identity_inside_current_heading_layout(self):
+        self.text = (
+            '【藥名與含量】\n商品名：Example 500mg tab\n中文名：未標示\n'
+            '學名：ExampleIngredient\n含量：500mg\n劑型：Tab\n廠牌：未標示\n許可證字號：未標示\n\n'
+            '【每次量】\n1 粒\n\n【可能副作用】\n未標示\n\n【警語】\n已標示警語'
+        )
+        result = self.run_scan()
+        self.assertEqual(result['rag']['status'], 'completed')
+        self.assertEqual(result['rag']['identity_match']['drug_id'], 1)
+        self.assertTrue(result['display_text'].startswith(self.text))
 
 if __name__ == '__main__':
     unittest.main()

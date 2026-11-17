@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import time
+from medication_identity import extract_identity
 
 logger = logging.getLogger(__name__)
 SUPPLEMENT_FIELDS = ("臨床用途（藥袋標示）", "可能副作用", "警語", "危險警訊")
@@ -29,17 +30,6 @@ def _fields(text):
     return fields
 
 
-def _name_matches(name, observed):
-    # Require a complete database name in the observed name, beyond fuzzy retrieval.
-    name = re.sub(r"\s+", " ", name or "").strip().casefold()
-    observed = re.sub(r"\s+", " ", observed).strip().casefold()
-    if len(name) < 3:
-        return False
-    left = r"(?<![a-z0-9])" if name[0].isascii() and name[0].isalnum() else ""
-    right = r"(?![a-z0-9])" if name[-1].isascii() and name[-1].isalnum() else ""
-    return bool(re.search(left + re.escape(name) + right, observed))
-
-
 def enrich_medication_result(result):
     """Preserve OCR text; append verified supplementary fields and a real duration."""
     original = result["display_text"].rstrip()
@@ -61,19 +51,18 @@ def enrich_medication_result(result):
             elif not missing:
                 section = "RAG 補充：可補充欄位已有內容，未執行查詢。"
             else:
-                from RAG.rag.service import search_drugs, chat_client
+                from RAG.rag.service import search_medication_sources, chat_client
                 from RAG.rag import config
-                sources = search_drugs(name, top_k=15)
-                ids = {row["drug_id"] for row in sources}
-                if not sources:
-                    metadata["status"] = "not_found"
-                    section = "RAG 補充：資料庫查無相符資料。"
-                elif len(ids) != 1 or not any(
-                    _name_matches(row.get("name_zh"), name) or _name_matches(row.get("name_en"), name)
-                    for row in sources
-                ):
+                observed = extract_identity(name)
+                lookup = search_medication_sources(observed, top_k=15)
+                sources = lookup["sources"]
+                metadata["identity_match"] = lookup["identity_match"]
+                if lookup["identity_match"]["status"] == "ambiguous":
                     metadata["status"] = "ambiguous"
-                    section = "RAG 補充：無法唯一確認同一藥品，未補充資料。"
+                    section = "RAG 補充：多筆藥品符合，無法唯一確認，未補充資料。"
+                elif not sources:
+                    metadata["status"] = "not_found"
+                    section = "RAG 補充：查無可確認為同一藥品的仿單資料，未補充資料。"
                 else:
                     evidence = "\n\n".join(
                         f"[{i}] {row['section']}\n{row['content']}"

@@ -121,6 +121,38 @@ def search_drugs(question, top_k=None, use_vectors=True):
             return []
         return [_public_row(row) for row in cur.fetchall()]
 
+
+def search_medication_sources(observed, top_k=15):
+    """Resolve a photo against existing metadata BEFORE limiting evidence chunks.
+
+    Read-only: no new columns, aliases, migrations, or embeddings are required.
+    Inspect all active product identities so a chunk limit cannot conceal ambiguity.
+    """
+    from medication_identity import resolve_medication
+    top_k = max(1, min(int(top_k), 30))
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, source_id, license_number, name_zh, name_en, ingredient
+            FROM rag_drugs WHERE is_active ORDER BY id
+        """)
+        keys = ('drug_id', 'source_id', 'license_number', 'name_zh', 'name_en', 'ingredient')
+        candidates = [dict(zip(keys, row)) for row in cur.fetchall()]
+        identity = resolve_medication(observed, candidates)
+        if identity["status"] != "matched":
+            return {"sources": [], "identity_match": identity}
+        cur.execute("""
+            SELECT d.id,d.source_id,d.license_number,d.name_zh,d.name_en,
+                   c.section,c.content,d.source,0 AS score
+            FROM rag_chunks c JOIN rag_drugs d ON d.id=c.drug_id
+            WHERE d.id=%s AND d.is_active
+            ORDER BY CASE WHEN c.section IN ('適應症','副作用','警語／注意事項','禁忌')
+                          THEN 0 ELSE 1 END, c.chunk_order, c.id
+            LIMIT %s
+        """, (identity["drug_id"], top_k))
+        return {"sources": [_public_row(row) for row in cur.fetchall()],
+                "identity_match": identity}
+
+
 def _timed_answer(answer, sources, started):
     elapsed = time.perf_counter() - started
     if os.getenv('RAG_SHOW_TIMING', 'true').strip().lower() in ('1', 'true', 'yes', 'on'):
