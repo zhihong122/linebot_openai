@@ -215,9 +215,9 @@ MENU_DEFINITIONS = {
                     "bounds": {"x": 834, "y": 0, "width": 833, "height": 843},
                     "action": {
                         "type": "postback",
-                        "label": "藥物說明",
+                        "label": "RAG藥物資訊",
                         "data": "action=elder_medicine_info",
-                        "displayText": "藥物說明",
+                        "displayText": "RAG藥物資訊",
                     },
                 },
                 {
