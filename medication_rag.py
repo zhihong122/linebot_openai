@@ -38,6 +38,28 @@ def _fields(text):
 
 
 
+
+def _summary_fields(text):
+    """Parse summary headings only; colons inside bullet text are not fields."""
+    aliases = {
+        "臨床用途（藥袋標示）": "臨床用途", "適應症": "臨床用途",
+        "副作用": "可能副作用", "不良反應": "可能副作用",
+        "警語／注意事項": "警語", "警語/注意事項": "警語",
+        "注意事項": "警語", "禁忌": "警語", "警語與注意事項": "警語",
+        "嚴重警告": "危險警訊", "黑框警告": "危險警訊",
+    }
+    fields, current = {}, None
+    for line in text.splitlines():
+        heading = re.match(r"^\s*(?:#{1,6}\s*)?(?:\*\*)?【([^】]+)】(?:\*\*)?\s*[:：]?\s*(.*)$", line)
+        if heading:
+            label = heading.group(1).strip()
+            current = aliases.get(label, label)
+            fields[current] = (fields.get(current, "") + "\n" + heading.group(2)).strip()
+        elif current:
+            fields[current] = (fields[current] + "\n" + line).strip()
+    return fields
+
+
 def _summarize_sections(entries, sources):
     """Use plain field headings; validate completion and citations before display."""
     from RAG.rag.service import chat_client
@@ -54,7 +76,8 @@ def _summarize_sections(entries, sources):
                 "不提供個人化劑量、服藥次數、停藥建議。"
                 "不要JSON、Markdown圍欄、藥名、許可證、來源列表或開場白。"
                 "每欄使用【欄位名稱】獨立一行，下一行寫摘要；每個重點附上證據編號如[2]。"
-                "沒有足夠依據時省略該欄。"
+                "必須逐字使用輸入的【欄位名稱】，不可將警語改成禁忌或其他標題。"
+                "重點內可以使用冒號，但不要另增標題。沒有足夠依據時省略該欄。"
             )},
             {"role": "user", "content": evidence[:config.MAX_EVIDENCE_CHARS]},
         ],
@@ -63,24 +86,30 @@ def _summarize_sections(entries, sources):
     if not response.choices or response.choices[0].finish_reason != "stop":
         raise ValueError("SUMMARY_INCOMPLETE")
     content = response.choices[0].message.content or ""
-    allowed = _fields(evidence)
-    parsed = _fields(content)
+    allowed = _summary_fields(evidence)
+    parsed = _summary_fields(content)
+    rejected = []
     output, supplemented = [], []
     for label, text in parsed.items():
         if label not in allowed:
-            raise ValueError("SUMMARY_UNEXPECTED_FIELD")
+            rejected.append((label, "unexpected_field"))
+            continue
         citations = re.findall(r"\[(\d+)\]", text)
         valid_ids = set(re.findall(r"\[(\d+)\]", allowed[label]))
         if not citations or any(i not in valid_ids for i in citations):
-            raise ValueError("SUMMARY_INVALID_CITATIONS")
+            rejected.append((label, "invalid_citations"))
+            continue
         clean = re.sub(r"\[\d+\]", "", text).strip()
         if not clean or len(clean) > 200 or any(
                 marker in clean for marker in ("許可證", "資料來源", "章節：", ".pdf", "http://", "https://")):
-            raise ValueError("SUMMARY_INVALID_CONTENT")
+            rejected.append((label, "invalid_content"))
+            continue
         output.append(f"【{label}】\n{clean}")
         supplemented.append("臨床用途（藥袋標示）" if label == "臨床用途" else label)
+    if rejected:
+        logger.warning("Medication RAG summary sections rejected: %s", rejected)
     if not output:
-        raise ValueError("SUMMARY_EMPTY")
+        raise ValueError("SUMMARY_NO_VALID_FIELDS")
     return output, supplemented
 
 
