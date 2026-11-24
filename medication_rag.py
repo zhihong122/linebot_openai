@@ -210,6 +210,18 @@ def enrich_medication_result(result):
     elapsed = time.perf_counter() - started
     metadata["elapsed_seconds"] = elapsed
     result["rag"] = metadata
+    if metadata["status"] == "completed" and metadata.get("supplemented_fields"):
+        is_tfda = any(
+            any(tag in str(source.get("source") or "").lower()
+                for tag in ("tfda", "食藥署", "食品藥物管理署"))
+            for source in metadata["sources"]
+        )
+        if is_tfda:
+            section += ("\n\n⚠️ 本資訊由 AI 依據 TFDA 藥品資料及仿單整理，僅供參考。"
+                        "實際用藥以醫師處方及藥師指示為準。")
+        else:
+            section += ("\n\n⚠️ 本資訊由 AI 依據藥品資料庫及仿單整理，僅供參考。"
+                        "實際用藥以醫師處方及藥師指示為準。")
     result["display_text"] = original + "\n\n" + section
     if os.getenv("RAG_SHOW_TIMING", "true").strip().lower() in ("1", "true", "yes", "on"):
         status = metadata["status"]
