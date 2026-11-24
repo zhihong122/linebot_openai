@@ -5849,7 +5849,11 @@ def gpt_response(user_text):
                     f"｜{source.get('section') or '仿單'}"
                     f"｜{source.get('license_number') or '無許可證資訊'}"
                 )
-            return answer + ("\n\n資料來源：\n" + "\n".join(references) if references else "")
+            if references:
+                answer += "\n\n資料來源：\n" + "\n".join(references)
+                answer += ("\n\n⚠️ 本回答由 AI 根據藥品資料庫產生，可能有誤，"
+                           "不能取代專業醫療建議。請勿自行停藥或調整劑量。")
+            return answer
         except Exception:
             app.logger.exception("RAG query failed")
             return "藥物資料查詢暫時無法使用，請稍後再試，或請藥師協助確認。"
