@@ -131,13 +131,17 @@ def search_medication_sources(observed, top_k=15, *, metrics=None, precomputed=F
     from medication_identity import resolve_medication
     top_k = max(1, min(int(top_k), 30))
     with connection() as conn, conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, source_id, license_number, name_zh, name_en, ingredient
-            FROM rag_drugs WHERE is_active ORDER BY id
-        """)
-        keys = ('drug_id', 'source_id', 'license_number', 'name_zh', 'name_en', 'ingredient')
-        candidates = [dict(zip(keys, row)) for row in cur.fetchall()]
-        identity = resolve_medication(observed, candidates)
+        if precomputed:
+            from .ordered_identity import find_identity
+            identity = find_identity(cur, observed)
+        else:
+            cur.execute("""
+                SELECT id, source_id, license_number, name_zh, name_en, ingredient
+                FROM rag_drugs WHERE is_active ORDER BY id
+            """)
+            keys = ('drug_id', 'source_id', 'license_number', 'name_zh', 'name_en', 'ingredient')
+            candidates = [dict(zip(keys, row)) for row in cur.fetchall()]
+            identity = resolve_medication(observed, candidates)
         if metrics is not None:
             metrics.end("matching")
         if identity["status"] != "matched":

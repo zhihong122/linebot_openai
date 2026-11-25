@@ -8,6 +8,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
+from RAG.rag.precomputed import enabled as precomputed_enabled
+
 
 ANALYSIS_PROMPT = """你是一個專門辨識臺灣醫療院所藥袋、處方箋與用藥標示的圖片分析助手。
 
@@ -16,8 +18,8 @@ ANALYSIS_PROMPT = """你是一個專門辨識臺灣醫療院所藥袋、處方�
 必要規則：
 1. 欄位完全沒有標示時填「未標示」；有標示但因模糊、反光、遮擋、皺褶、裁切或解析度不足無法確認時填「看不清楚」。
 2. 不得自行補充副作用、警語、危險警訊、注意事項、禁忌、疾病建議、藥理作用、用藥時間表、停藥方式、劑量調整或任何一般醫學知識。
-3. 「每次量」只放單次量；「一天幾次／每幾小時」只放頻率或間隔；「與餐關係」只放餐前後資訊；「早／中／晚／睡前」只放圖片實際標示的時段。
-4. 「用藥方式」可以整合圖片上已有內容成一句，但不得自行安排時間。
+3. 「每次量」只放藥袋明寫的單次用量，左眼或右眼只屬給藥部位；「一天幾次／每幾小時」只放頻率或間隔；「與餐關係」只放餐前後資訊；「早／中／晚／睡前」只放圖片實際標示的時段。
+4. 「用藥方式」逐字轉錄藥袋用法；核對「二」和「三」等字形。頻率欄須與原文一致，看不清楚就如實標記。
 5. PRN 必須擷取圖片實際標示的使用條件、單次量、最短間隔與每日上限；個別項目沒寫就寫未標示。完全沒有 PRN 就寫未標示。
 6. 療程與總量只照圖片輸出，不得加入「剛好吃完」等說明。
 7. 臨床用途只能擷取藥袋上實際寫出的用途，不得由藥名推測。
@@ -67,6 +69,12 @@ ANALYSIS_PROMPT = """你是一個專門辨識臺灣醫療院所藥袋、處方�
 【QR Code（掃描後連結）】
 內容
 """
+
+
+V2_ANALYSIS_PROMPT = ANALYSIS_PROMPT.replace(
+    "10. 「藥名與含量」只輸出圖片上可見的藥名與每錠、每粒或每單位含量，保留原文與單位，以一行呈現。不得拆分或新增「商品名、中文名、學名、含量、劑型、廠牌、許可證字號」等子欄位；不得由藥名推測或補充成分、廠牌、劑型或許可證字號。只使用下列固定的 13 個欄位，不得新增欄位或子欄位。",
+    "10. 在「藥名與含量」下逐行標示照片可見的「商品名：」「中文名：」「學名：」「含量：」「包裝量：」「劑型：」「廠牌：」「許可證字號：」。只寫照片可確認的欄位。每錠或每克成分濃度填含量，每管總量例如 3g/條填包裝量。維持其他欄位的原格式。",
+)
 
 
 @dataclass
@@ -241,7 +249,7 @@ def analyze_medication_image(client, image_path: str, model: str = "gpt-4.1", *,
     image_url = _image_data_url(image_path)
     request = dict(
         model=model,
-        instructions=ANALYSIS_PROMPT,
+        instructions=V2_ANALYSIS_PROMPT if precomputed_enabled() else ANALYSIS_PROMPT,
         input=[
             {
                 "role": "user",

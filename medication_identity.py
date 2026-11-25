@@ -10,7 +10,7 @@ MISSING = {'', '未標示', '看不清楚', '無法確認', '未提供'}
 LABELS = {
     '商品名': 'trade_name', '商品名稱': 'trade_name', '中文名': 'name_zh',
     '中文名稱': 'name_zh', '學名': 'ingredient', '成分': 'ingredient',
-    '含量': 'strength', '劑型': 'dosage_form', '廠牌': 'manufacturer',
+    '含量': 'strength', '包裝量': 'package_size', '劑型': 'dosage_form', '廠牌': 'manufacturer',
     '製造廠': 'manufacturer', '許可證字號': 'license_number',
 }
 STRENGTH_RE = re.compile(
