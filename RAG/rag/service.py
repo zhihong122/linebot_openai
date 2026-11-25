@@ -122,7 +122,7 @@ def search_drugs(question, top_k=None, use_vectors=True):
         return [_public_row(row) for row in cur.fetchall()]
 
 
-def search_medication_sources(observed, top_k=15):
+def search_medication_sources(observed, top_k=15, *, metrics=None):
     """Resolve a photo against existing metadata BEFORE limiting evidence chunks.
 
     Read-only: no new columns, aliases, migrations, or embeddings are required.
@@ -138,8 +138,12 @@ def search_medication_sources(observed, top_k=15):
         keys = ('drug_id', 'source_id', 'license_number', 'name_zh', 'name_en', 'ingredient')
         candidates = [dict(zip(keys, row)) for row in cur.fetchall()]
         identity = resolve_medication(observed, candidates)
+        if metrics is not None:
+            metrics.end("matching")
         if identity["status"] != "matched":
             return {"sources": [], "identity_match": identity}
+        if metrics is not None:
+            metrics.start("completion")
         cur.execute("""
             SELECT d.id,d.source_id,d.license_number,d.name_zh,d.name_en,
                    c.section,c.content,d.source,0 AS score

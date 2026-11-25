@@ -235,10 +235,11 @@ def _image_data_url(image_path: str) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
-def analyze_medication_image(client, image_path: str, model: str = "gpt-4.1") -> dict:
+def analyze_medication_image(client, image_path: str, model: str = "gpt-4.1", *, metrics=None) -> dict:
     """Run real QR decoding, then ask GPT-4.1 to transcribe the medication bag."""
     qr = decode_qr(image_path)
-    response = client.responses.create(
+    image_url = _image_data_url(image_path)
+    request = dict(
         model=model,
         instructions=ANALYSIS_PROMPT,
         input=[
@@ -253,7 +254,7 @@ def analyze_medication_image(client, image_path: str, model: str = "gpt-4.1") ->
                             + qr.prompt_context()
                         ),
                     },
-                    {"type": "input_image", "image_url": _image_data_url(image_path)},
+                    {"type": "input_image", "image_url": image_url},
                 ],
             }
         ],
@@ -262,8 +263,16 @@ def analyze_medication_image(client, image_path: str, model: str = "gpt-4.1") ->
         top_p=1,
         store=False,
     )
+    if metrics is None:
+        response = client.responses.create(**request)
+    else:
+        with metrics.phase("vision"):
+            response = client.responses.create(**request)
     display_text = (getattr(response, "output_text", "") or "").strip()
     if not display_text:
+        if metrics is not None:
+            metrics.data["vision_ms"] = None
+            metrics.data["error_stage"] = "vision"
         raise RuntimeError("OpenAI 沒有返回藥袋辨識內容")
     return {
         "display_text": display_text,

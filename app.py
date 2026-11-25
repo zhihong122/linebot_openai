@@ -18,6 +18,7 @@ from Health_Adapter.Apple_Health_Adapter.apple_health import register_apple_heal
 from openai import OpenAI
 from medication_analyzer import analyze_medication_image
 from medication_rag import enrich_medication_result
+from medication_performance import MedicationPerformance
 from master_roles import MasterRoles
 
 from Richmenu.richmenu_manager import get_home_rich_menu_id
@@ -5914,15 +5915,16 @@ def save_medication_scan_analysis(scan_id, result=None, error_message=None):
         connection.close()
 
 
-def process_medication_scan(scan_id, image_path):
+def process_medication_scan(scan_id, image_path, *, metrics=None):
     """Decode QR locally, analyze the bag with GPT-4.1, and persist it."""
     try:
         result = analyze_medication_image(
             client=openai_client,
             image_path=image_path,
             model=os.getenv("MEDICATION_VISION_MODEL", "gpt-4.1"),
+            metrics=metrics,
         )
-        result = enrich_medication_result(result)
+        result = enrich_medication_result(result, metrics=metrics)
         save_medication_scan_analysis(scan_id, result=result)
         return result
     except Exception as error:
@@ -5937,32 +5939,50 @@ def process_medication_scan(scan_id, image_path):
 
 
 
-def start_medication_scan_reply(event, scan_id, image_path, heading):
+def start_medication_scan_reply(event, scan_id, image_path, heading, *, received_at=None):
     """Acknowledge before slow vision/RAG work; push all chunks including timing."""
+    metrics = MedicationPerformance(received_at)
     source = event.source
     target = (getattr(source, "group_id", None)
               or getattr(source, "room_id", None)
               or getattr(source, "user_id", None))
     if not target:
+        metrics.finish(app.logger, "routing")
         raise RuntimeError("無法辨識照片回覆對象")
     if not _rag_slots.acquire(blocking=False):
-        save_medication_scan_analysis(scan_id, error_message="分析工作繁忙，請重新上傳")
-        reply_text(event.reply_token, "目前分析工作較多，請稍後重新上傳照片。")
+        try:
+            save_medication_scan_analysis(scan_id, error_message="分析工作繁忙，請重新上傳")
+            reply_text(event.reply_token, "目前分析工作較多，請稍後重新上傳照片。")
+        finally:
+            metrics.finish(app.logger, "queue")
         return
 
     def run():
         api_client = None
+        error_stage = "analysis"
         try:
-            result = process_medication_scan(scan_id, image_path)
+            result = process_medication_scan(scan_id, image_path, metrics=metrics)
+            error_stage = "reply"
             text = heading + result["display_text"]
             # Do not truncate the last line; LINE allows up to five messages per push.
             chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
             api_client, messaging_api = get_messaging_api()
-            for offset in range(0, len(chunks), 5):
-                messaging_api.push_message(PushMessageRequest(
-                    to=target,
-                    messages=[TextMessage(text=chunk) for chunk in chunks[offset:offset + 5]],
-                ))
+            with metrics.phase("reply"):
+                for offset in range(0, len(chunks), 5):
+                    messaging_api.push_message(PushMessageRequest(
+                        to=target,
+                        messages=[TextMessage(text=chunk) for chunk in chunks[offset:offset + 5]],
+                    ))
+            metrics.end("total")
+            rag = result["rag"]
+            if rag["status"] in ("summary_failed", "failed") or (
+                rag.get("missing_fields") and rag["status"] != "skipped"
+                and (rag["status"] != "completed" or rag.get("unfilled_fields"))
+            ):
+                metrics.data["status"] = "partial"
+            else:
+                metrics.data["status"] = "success"
+            error_stage = None
         except Exception:
             app.logger.exception("Background medication scan failed")
             try:
@@ -5974,15 +5994,19 @@ def start_medication_scan_reply(event, scan_id, image_path, heading):
             except Exception:
                 app.logger.exception("Medication failure notification failed")
         finally:
-            if api_client is not None:
-                api_client.close()
-            _rag_slots.release()
+            try:
+                if api_client is not None:
+                    api_client.close()
+            finally:
+                _rag_slots.release()
+                metrics.finish(app.logger, error_stage)
 
     try:
         reply_text(event.reply_token, "已收到照片，正在辨識並比對藥品資料，完成後會回覆結果。")
         threading.Thread(target=run, daemon=True, name="medication-rag-scan").start()
     except Exception:
         _rag_slots.release()
+        metrics.finish(app.logger, "acknowledgment")
         raise
 
 
@@ -6406,6 +6430,7 @@ def handle_text_message(event):
     message=ImageMessageContent,
 )
 def handle_image_message(event):
+    received_at = time.perf_counter()
     user_id = get_user_id(event)
 
     try:
@@ -6474,6 +6499,7 @@ def handle_image_message(event):
             start_medication_scan_reply(
                 event, scan_id, image_path,
                 "藥袋辨識完成，家屬可在「藥袋紀錄」中查看。\n\n",
+                received_at=received_at,
             )
             return
 
@@ -6503,6 +6529,7 @@ def handle_image_message(event):
             start_medication_scan_reply(
                 event, scan_id, image_path,
                 f"{patient['patient_name']} – Prescription analysis complete\n\n",
+                received_at=received_at,
             )
             return
 
