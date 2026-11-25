@@ -156,7 +156,7 @@ def decode_qr(image_path: str) -> QRResult:
             results = zxingcpp.read_barcodes(candidate)
             if results:
                 for result in results:
-                    if "qrcode" not in str(getattr(result, "format", "")).lower():
+                    if result.format != zxingcpp.BarcodeFormat.QRCode:
                         continue
                     detected = True
                     value = _url_or_text(getattr(result, "text", None))
