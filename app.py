@@ -5964,6 +5964,9 @@ def start_medication_scan_reply(event, scan_id, image_path, heading, *, received
             result = process_medication_scan(scan_id, image_path, metrics=metrics)
             error_stage = "reply"
             text = heading + result["display_text"]
+            vision_ms = metrics.data["vision_ms"]
+            if vision_ms is not None:
+                text += f"\n\nOpenAI 雲端辨識耗時：{vision_ms / 1000:.2f} 秒"
             # Do not truncate the last line; LINE allows up to five messages per push.
             chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
             api_client, messaging_api = get_messaging_api()
