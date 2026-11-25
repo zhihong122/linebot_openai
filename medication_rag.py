@@ -211,8 +211,13 @@ def enrich_medication_result(result, *, metrics=None):
                     if metrics is not None and metadata["supplemented_fields"]:
                         metrics.data["summary_used"] = True
                 elif not sources:
-                    metadata["status"] = "not_found"
-                    section = "RAG 補充：查無可確認為同一藥品的仿單資料，未補充資料。"
+                    if lookup["identity_match"]["status"] == "matched":
+                        metadata["status"] = "no_supplement"
+                        section = "RAG 補充：已確認藥品，但資料庫沒有可讀取的仿單內容。"
+                    else:
+                        metadata["status"] = "not_found"
+                        section = ("RAG 補充：未能確認藥品身分。資料庫可能缺這款藥，"
+                                   "也可能是藥名、含量或劑型與辨識結果不符。未補充警語。")
                 else:
                     stage = "來源欄位對應"
                     entries = []

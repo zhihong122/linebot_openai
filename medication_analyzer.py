@@ -128,7 +128,8 @@ def decode_qr(image_path: str) -> QRResult:
     failures: list[str] = []
     detected = False
     complete: Optional[bool] = None
-    detected_points = None
+    saw_interior_corners = False
+    saw_boundary_corners = False
 
     try:
         import cv2
@@ -139,8 +140,6 @@ def decode_qr(image_path: str) -> QRResult:
     image = cv2.imread(str(image_path))
     if image is None:
         return QRResult(None, False, None, [], None, ["圖片無法讀取"])
-
-    height, width = image.shape[:2]
 
     # Decoder 1: ZXing-C++ is packaged as a wheel and does not require libzbar.
     try:
@@ -190,7 +189,9 @@ def decode_qr(image_path: str) -> QRResult:
             value, points, _ = detector.detectAndDecode(candidate)
             if points is not None:
                 detected = True
-                detected_points = points
+                inside = _qr_is_complete(points, candidate.shape[1], candidate.shape[0])
+                saw_interior_corners |= inside is True
+                saw_boundary_corners |= inside is False
             value = _url_or_text(value)
             if value:
                 scaled_height, scaled_width = candidate.shape[:2]
@@ -211,14 +212,19 @@ def decode_qr(image_path: str) -> QRResult:
             value, points, _ = detector.detectAndDecode(candidate)
             if points is not None:
                 detected = True
+                inside = _qr_is_complete(points, candidate.shape[1], candidate.shape[0])
+                saw_interior_corners |= inside is True
+                saw_boundary_corners |= inside is False
             value = _url_or_text(value)
             if value:
                 return QRResult(value, True, _qr_is_complete(points, candidate.shape[1], candidate.shape[0]), attempted, method, [])
         except Exception:
             continue
 
-    if detected_points is not None:
-        complete = _qr_is_complete(detected_points, width, height)
+    if saw_interior_corners:
+        complete = True
+    elif saw_boundary_corners:
+        complete = False
     if detected:
         failures.append("多種解碼策略仍無內容")
         if complete is False:
@@ -275,6 +281,11 @@ def analyze_medication_image(client, image_path: str, model: str = "gpt-4.1", *,
             metrics.data["vision_ms"] = None
             metrics.data["error_stage"] = "vision"
         raise RuntimeError("OpenAI 沒有返回藥袋辨識內容")
+    # Use the decoder result even when the vision model rewrites the QR field.
+    display_text = re.sub(
+        r"(?m)^【QR Code（掃描後連結）】[^\n]*(?:\n(?!【)[^\n]*)*", "", display_text,
+    ).rstrip()
+    display_text += "\n\n【QR Code（掃描後連結）】\n" + qr.field_value
     return {
         "display_text": display_text,
         "model": model,
