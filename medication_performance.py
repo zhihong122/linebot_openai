@@ -6,15 +6,18 @@ import os
 import time
 from uuid import uuid4
 
+from RAG.rag.precomputed import enabled as precomputed_enabled
+
 
 class MedicationPerformance:
     def __init__(self, received_at=None):
+        use_precomputed = precomputed_enabled()
         self.data = {
             "request_id": str(uuid4()),
             "tested_at": datetime.now(timezone.utc).isoformat(),
-            "system_version": "legacy",
+            "system_version": "V2" if use_precomputed else "legacy",
             "vision_model": os.getenv("MEDICATION_VISION_MODEL", "gpt-4.1"),
-            "rag_model": os.getenv("RAG_CHAT_MODEL", "gpt-oss:20b"),
+            "rag_model": None if use_precomputed else os.getenv("RAG_CHAT_MODEL", "gpt-oss:20b"),
             "drug_count": None,
             "vision_ms": None,
             "matching_ms": None,
