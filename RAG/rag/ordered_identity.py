@@ -44,6 +44,28 @@ def _strength(value):
     return (f"mass/{divisor_dimension}", quantity / divisor)
 
 
+def _strength_profile(value):
+    """Preserve the ingredient-to-strength mapping in semicolon-delimited combinations."""
+    text = clean(value)
+    single = _strength(text)
+    if single is not None:
+        return single
+    components = [part.strip() for part in text.split(";")]
+    if len(components) < 2:
+        return None
+    profile = {}
+    for component in components:
+        match = re.fullmatch(r"([^0-9]+?)\s+(\d.+)", component)
+        if not match:
+            return None
+        name = identity_key(match[1])
+        strength = _strength(match[2])
+        if not name or not strength or name in profile:
+            return None
+        profile[name] = strength
+    return "combination", tuple(sorted(profile.items()))
+
+
 def _form(text):
     return ({"ophthalmic_ointment"}, set()) if clean(text) in OPHTHALMIC_FORMS else dosage_form(text)
 
@@ -83,14 +105,14 @@ def find_identity(cur, observed):
 
 def rank_candidates(observed, rows):
     """Only a unique full match can supply a leaflet. Partial hits are diagnostic."""
-    actual_strength = _strength(observed.get("strength"))
+    actual_strength = _strength_profile(observed.get("strength"))
     actual_form = _form(observed.get("dosage_form"))
     actual_package = clean(observed.get("package_size"))
     actual_license = license_key(observed.get("license_number"))
     full = []
     partial = []
     for drug_id, source_id, license_no, name_zh, name_en, manufacturer, strength, form, package, aliases in rows:
-        expected_strength = _strength(strength)
+        expected_strength = _strength_profile(strength)
         expected_form = _form(form)
         if actual_license and actual_license != license_key(license_no):
             continue
