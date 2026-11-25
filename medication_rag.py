@@ -4,6 +4,7 @@ import os
 import re
 import time
 from medication_identity import extract_identity
+from RAG.rag.precomputed import enabled as precomputed_enabled
 
 logger = logging.getLogger(__name__)
 SECTION_FIELDS = {
@@ -128,11 +129,51 @@ def _summarize_sections(entries, sources, *, metrics=None):
     return output, supplemented
 
 
+def _fill_precomputed(missing, summary, metadata):
+    fields = {
+        "臨床用途（藥袋標示）": (("clinical_use", "臨床用途"),),
+        "可能副作用": (("side_effects", "可能副作用"),),
+        "警語": (("warnings", "警語"), ("contraindications", "禁忌"),
+               ("interactions", "交互作用")),
+        "危險警訊": (("red_flags", "危險警訊"),),
+    }
+    sections, supplemented = [], []
+    evidence = summary["evidence"] if summary else {}
+    for field in missing:
+        for key, label in fields[field]:
+            value = (summary.get(key) or "").strip() if summary else ""
+            if value and evidence.get(key):
+                sections.append(f"【{label}】\n{value}")
+                if field not in supplemented:
+                    supplemented.append(field)
+    metadata["supplemented_fields"] = supplemented
+    metadata["unfilled_fields"] = [field for field in missing if field not in supplemented]
+    if not sections:
+        metadata["status"] = "no_supplement"
+        return "RAG 補充：沒有可用的審核摘要，未補充資料。"
+
+    identity = metadata["identity_match"]
+    metadata.update(
+        status="completed",
+        leaflet_version=summary["leaflet_version"],
+        summary_model=summary["model_version"],
+        evidence={key: evidence[key] for field in supplemented for key, _ in fields[field]
+                  if summary.get(key) and evidence.get(key)},
+    )
+    sections.append(f"來源：{identity.get('name_zh') or identity.get('name_en')}"
+                    f"（許可證：{identity['license_number']}）仿單審核摘要")
+    if metadata["unfilled_fields"]:
+        sections.append("未補充：" + "、".join(metadata["unfilled_fields"]) + "（無審核資料）。")
+    return "RAG 補充：\n" + "\n\n".join(sections)
+
+
 def enrich_medication_result(result, *, metrics=None):
     """Preserve OCR text; append verified supplementary fields and a real duration."""
     original = result["display_text"].rstrip()
     started = time.perf_counter()
-    metadata = {"status": "skipped", "sources": [], "method": "source_summary"}
+    use_precomputed = precomputed_enabled()
+    metadata = {"status": "skipped", "sources": [],
+                "method": "reviewed_summary" if use_precomputed else "source_summary"}
     stage = "設定檢查"
     section = ""
     enabled = os.getenv("RAG_MEDICATION_ENABLED", os.getenv("RAG_ENABLED", "false"))
@@ -159,12 +200,16 @@ def enrich_medication_result(result, *, metrics=None):
                     metrics.data["summary_used"] = False
                 observed = extract_identity(name)
                 stage = "資料庫檢索"
-                lookup = search_medication_sources(observed, top_k=30, metrics=metrics)
+                lookup = search_medication_sources(observed, top_k=30, metrics=metrics, precomputed=use_precomputed)
                 sources = lookup["sources"]
                 metadata["identity_match"] = lookup["identity_match"]
                 if lookup["identity_match"]["status"] == "ambiguous":
                     metadata["status"] = "ambiguous"
                     section = "RAG 補充：多筆藥品符合，無法唯一確認，未補充資料。"
+                elif use_precomputed and lookup["identity_match"]["status"] == "matched":
+                    section = _fill_precomputed(missing, lookup["summary"], metadata)
+                    if metrics is not None and metadata["supplemented_fields"]:
+                        metrics.data["summary_used"] = True
                 elif not sources:
                     metadata["status"] = "not_found"
                     section = "RAG 補充：查無可確認為同一藥品的仿單資料，未補充資料。"
