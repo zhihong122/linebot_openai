@@ -8,7 +8,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
-from RAG.rag.precomputed import enabled as precomputed_enabled
 
 
 ANALYSIS_PROMPT = """你是一個專門辨識臺灣醫療院所藥袋、處方箋與用藥標示的圖片分析助手。
@@ -25,7 +24,7 @@ ANALYSIS_PROMPT = """你是一個專門辨識臺灣醫療院所藥袋、處方�
 7. 臨床用途只能擷取藥袋上實際寫出的用途，不得由藥名推測。
 8. 副作用、警語、危險警訊若有原始編號或符號，必須保留；一條一行，不得合併或自行分類嚴重程度。
 9. QR Code 已由後端解碼器實際處理。你必須逐字使用使用者訊息提供的 QR 結果，只輸出「QR Code（掃描後連結）」欄位，不得輸出解碼狀態、是否偵測到、是否完整、執行方法、成功方法或失敗原因，不得從圖片猜測、修改或補齊網址，也不得聲稱使用 Code Interpreter。
-10. 「藥名與含量」只輸出圖片上可見的藥名與每錠、每粒或每單位含量，保留原文與單位，以一行呈現。不得拆分或新增「商品名、中文名、學名、含量、劑型、廠牌、許可證字號」等子欄位；不得由藥名推測或補充成分、廠牌、劑型或許可證字號。只使用下列固定的 13 個欄位，不得新增欄位或子欄位。
+10. 在「藥名與含量」內逐行標示照片上能確認的「商品名：」「中文名：」「學名：」「含量：」「包裝量：」「劑型：」「廠牌：」「許可證字號：」。逐字抄錄品名，不要用藥理知識改寫。仔細區別「膜衣錠」與「腸衣錠／腸溶錠」；看不清楚就如實填寫，不得猜。每錠或每克成分含量填「含量」，複方各成分名稱及含量以分號分隔；每管總重量例如 3g/條填「包裝量」。
 11. 使用繁體中文及臺灣常用醫療用語；不要輸出前言、結語、Python 程式碼、Markdown 粗體或「照抄藥袋」等註解。
 
 固定輸出格式（每個欄位都必須保留）：
@@ -69,12 +68,6 @@ ANALYSIS_PROMPT = """你是一個專門辨識臺灣醫療院所藥袋、處方�
 【QR Code（掃描後連結）】
 內容
 """
-
-
-V2_ANALYSIS_PROMPT = ANALYSIS_PROMPT.replace(
-    "10. 「藥名與含量」只輸出圖片上可見的藥名與每錠、每粒或每單位含量，保留原文與單位，以一行呈現。不得拆分或新增「商品名、中文名、學名、含量、劑型、廠牌、許可證字號」等子欄位；不得由藥名推測或補充成分、廠牌、劑型或許可證字號。只使用下列固定的 13 個欄位，不得新增欄位或子欄位。",
-    "10. 在「藥名與含量」下逐行標示照片可見的「商品名：」「中文名：」「學名：」「含量：」「包裝量：」「劑型：」「廠牌：」「許可證字號：」。只寫照片可確認的欄位。每錠或每克成分濃度填含量；複方逐一保留可確認的成分名稱及含量，各項以分號分隔。每管總量例如 3g/條填包裝量。維持其他欄位的原格式。",
-)
 
 
 @dataclass
@@ -249,7 +242,7 @@ def analyze_medication_image(client, image_path: str, model: str = "gpt-4.1", *,
     image_url = _image_data_url(image_path)
     request = dict(
         model=model,
-        instructions=V2_ANALYSIS_PROMPT if precomputed_enabled() else ANALYSIS_PROMPT,
+        instructions=ANALYSIS_PROMPT,
         input=[
             {
                 "role": "user",

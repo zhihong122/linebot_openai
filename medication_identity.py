@@ -43,6 +43,14 @@ def extract_identity(name_block):
     if conflicts:
         result['conflicting_fields'] = conflicts
     if len(result) == 1:
+        # Some OCR responses join brand, generic and Chinese product name with 、.
+        parts = [part.strip() for part in name_block.split('、')]
+        if (len(parts) == 3 and all(parts)
+                and re.search(r'[A-Za-z]', parts[0])
+                and re.fullmatch(r'[A-Za-z][A-Za-z0-9 ().,+/-]*', parts[1])
+                and re.search(r'[\u3400-\u9fff]', parts[2])):
+            result.update(trade_name=parts[0], ingredient=parts[1], name_zh=parts[2])
+            return result
         # Old output often joins brand and generic with a semicolon.
         parts = re.split(r'[;；\n]', name_block, maxsplit=1)
         result['trade_name'] = parts[0].strip()
@@ -79,7 +87,7 @@ def dosage_form(text):
     releases = set()
     for name, pattern in (
         ('extended', r'緩釋|持續性|長效|\b(?:sr|xr|er|cr|mr)\b|extended[ -]release|sustained[ -]release'),
-        ('enteric', r'腸溶|\be\.?\s*c\.?\b|enteric'),
+        ('enteric', r'腸溶|腸衣|\be\.?\s*c\.?\b|enteric'),
     ):
         if re.search(pattern, text):
             releases.add(name)
