@@ -76,7 +76,7 @@ def _compact_summary(text):
     return clean
 
 
-def _summarize_sections(entries, sources):
+def _summarize_sections(entries, sources, *, metrics=None):
     """Retain valid fields and fall back to labelled source excerpts on summary errors."""
     from RAG.rag.service import chat_client
     from RAG.rag import config
@@ -104,6 +104,7 @@ def _summarize_sections(entries, sources):
             logger.warning("Medication RAG summary incomplete; using source excerpts")
     except Exception:
         logger.exception("Medication RAG summary unavailable; using source excerpts")
+    used_summary = False
     output, supplemented = [], []
     for label, evidence in allowed.items():
         text = parsed.get(label, "")
@@ -117,14 +118,17 @@ def _summarize_sections(entries, sources):
             clean = _compact_summary(evidence)
             prefix = "仿單原文節錄（摘要暫不可用）：\n"
         else:
+            used_summary = True
             prefix = ""
         if clean:
             output.append(f"【{label}】\n{prefix}{clean}")
             supplemented.append("臨床用途（藥袋標示）" if label == "臨床用途" else label)
+    if metrics is not None:
+        metrics.data["summary_used"] = used_summary
     return output, supplemented
 
 
-def enrich_medication_result(result):
+def enrich_medication_result(result, *, metrics=None):
     """Preserve OCR text; append verified supplementary fields and a real duration."""
     original = result["display_text"].rstrip()
     started = time.perf_counter()
@@ -149,9 +153,13 @@ def enrich_medication_result(result):
             else:
                 from RAG.rag.service import search_medication_sources
                 stage = "藥品身分解析"
+                if metrics is not None:
+                    metrics.start("rag_total")
+                    metrics.start("matching")
+                    metrics.data["summary_used"] = False
                 observed = extract_identity(name)
                 stage = "資料庫檢索"
-                lookup = search_medication_sources(observed, top_k=30)
+                lookup = search_medication_sources(observed, top_k=30, metrics=metrics)
                 sources = lookup["sources"]
                 metadata["identity_match"] = lookup["identity_match"]
                 if lookup["identity_match"]["status"] == "ambiguous":
@@ -185,7 +193,7 @@ def enrich_medication_result(result):
                     if entries:
                         stage = "模型摘要"
                         try:
-                            entries, supplemented = _summarize_sections(entries, sources)
+                            entries, supplemented = _summarize_sections(entries, sources, metrics=metrics)
                             metadata["status"] = "completed"
                             section = "RAG 補充：\n" + "\n\n".join(entries)
                         except Exception as error:
@@ -207,6 +215,12 @@ def enrich_medication_result(result):
         metadata.update(status="failed", error_type=type(error).__name__, error_stage=stage)
         section = (f"RAG 補充：{stage}失敗（{type(error).__name__}），本次保留照片辨識結果。"
                    "\n詳細原因已記錄於伺服器日誌：Medication RAG enrichment failed。")
+    if metrics is not None:
+        if metadata["status"] in ("failed", "summary_failed"):
+            metrics.fail_open_phase()
+        else:
+            metrics.end("completion")
+            metrics.end("rag_total")
     elapsed = time.perf_counter() - started
     metadata["elapsed_seconds"] = elapsed
     result["rag"] = metadata
